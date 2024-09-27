@@ -17,9 +17,9 @@ type DBman struct {
 var instance *DBman
 var once sync.Once
 
-func GetDB(loc string) *DBman {
+func GetDB() *DBman {
 	once.Do(func() {
-		db, err := bbolt.Open(loc, 0666, nil)
+		db, err := bbolt.Open("../../testDB", 0666, nil)
 		if err != nil {
 			log.Fatal(err)
 		}

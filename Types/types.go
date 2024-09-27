@@ -7,13 +7,16 @@ type GetBalanceResponse struct {
 	Balance float64 `json:"balance"`
 }
 type UTXO struct {
-	TxHash      [32]byte `json:"txid"`
-	OutputIndex int      `json:"index"`
-	Value       float64  `json:"amount"`
+	TxID         string `json:"txhash"`
+	OutputIndex  uint32 `json:"outputIndex"`
+	Amount       int64  `json:"amount"`
+	ScriptPubKey string `json:"scriptKey"`
+	BlockHash    string `json:"blockhash"`
 }
-type SendTransaction struct {
-	Signature  string `json:"signature"`
-	InputUtxos []UTXO `json:"inputs"`
-	Sender     string `json:"sender"`
-	Reciver    string `json:"reciver"`
+type Transaction struct {
+	TxnHash  string `json:"txnHash"`
+	Sender   string `json:"sender"`
+	Receiver string `json:"receiver"` // Fixed typo in "receiver"
+	Inputs   []UTXO `json:"inputs"`
+	Outputs  []UTXO `json:"outputs"`
 }

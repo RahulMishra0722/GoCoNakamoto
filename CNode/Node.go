@@ -1,217 +1,150 @@
-package cnode
+package main
 
 import (
-	"encoding/binary"
+	"bufio"
+	"bytes"
 	"fmt"
-	"io"
+	"log"
 	"net"
-	"sync"
+	"net/http"
 	"time"
 )
 
-// Constants
-const (
-	Version           = 0.1
-	DefaultBufferSize = 4096
-)
+// Server ...
+type Server struct {
+	host string
+	port string
+}
 
-// Services represents the services offered by a node
-type Services uint64
-
-const (
-	FullNode Services = 1 << iota
-	TransactionAndRelay
-)
-
-// MessageType represents different types of messages
-type MessageType uint32
-
-const (
-	Addr MessageType = iota
-	Inv
-	GetData
-	GetBlocks
-	Tx
-	Block
-	GetAddr
-	CheckOrder
-	SubmitOrder
-	Reply
-)
-
-// CNode represents a connection to a peer in the network
+// Client ...
 type CNode struct {
-	ConnectedAt             time.Time
-	Socket                  net.Conn
-	InBound                 bool
-	Addr                    net.Addr
-	LastSentTo              time.Time
-	LastReceivedFrom        time.Time
-	HaveHandShaked          bool
-	Services                Services
-	LastPinged              time.Time
-	DisconnectRequested     bool
-	ExchangedVersionMessage bool
-	sendChan                chan []byte
-	recvChan                chan []byte
-	done                    chan struct{}
+	conn             net.Conn
+	VSend            chan string
+	ExchangedVersion bool
 }
 
-// MessageWithHeader represents a message with its header
-type MessageWithHeader struct {
-	Type       MessageType
-	DataLength uint32
-	Services   Services
-	Data       []byte
-	Time       time.Time
-	Addr       net.Addr
+// Config ...
+type Config struct {
+	Host string
+	Port string
 }
 
-// VersionHeaders represents the headers for a version message
-type VersionHeaders struct {
-	Version  float64
-	Services Services
-	Time     time.Time
-	Addr     net.Addr
-}
-
-var (
-	nodes             []*CNode
-	nodesMutex        sync.RWMutex
-	disconnectedNodes []*CNode
-)
-
-// NewCNode creates a new CNode
-func NewCNode(conn net.Conn, inbound bool) *CNode {
-	return &CNode{
-		ConnectedAt: time.Now(),
-		Socket:      conn,
-		Addr:        conn.RemoteAddr(),
-		InBound:     inbound,
-		sendChan:    make(chan []byte, 100),
-		recvChan:    make(chan []byte, 100),
-		done:        make(chan struct{}),
+//   - - This is the json structure  our seeder expects DoesEverything DoesValidateAndRelay these are optional you only have to send one
+//     var req struct {
+//     Addr     string `json:"address"`
+//     Services struct {
+//     DoesEverything       bool `json:"doesEverything"`
+//     DoesValidateAndRelay bool `json:"doesValidateAndRelay"`
+//     } `json:"services"`
+//     }
+//
+// New ...
+func New(config *Config) *Server {
+	return &Server{
+		host: config.Host,
+		port: config.Port,
 	}
 }
+func handleCallSeeder() {
 
-// Start begins processing for the CNode
-func (cn *CNode) Start() {
-	go cn.readLoop()
-	go cn.writeLoop()
-}
-
-func (cn *CNode) readLoop() {
-	defer close(cn.recvChan)
-	buf := make([]byte, DefaultBufferSize)
-	for {
-		n, err := cn.Socket.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				fmt.Printf("Read error from %s: %v\n", cn.Addr, err)
-			}
-			cn.requestDisconnect()
-			return
-		}
-		select {
-		case cn.recvChan <- buf[:n]:
-			cn.LastReceivedFrom = time.Now()
-		case <-cn.done:
-			return
-		}
+	// get your public facing ip
+	// for now we'll use machine's
+	url := `http://localhost:8080/ReadyToServe`
+	jsonData := `{
+	address::8081
+	"services": {
+	  "doesEverything": true
 	}
-}
-
-func (cn *CNode) writeLoop() {
-	for {
-		select {
-		case data := <-cn.sendChan:
-			_, err := cn.Socket.Write(data)
-			if err != nil {
-				fmt.Printf("Write error to %s: %v\n", cn.Addr, err)
-				cn.requestDisconnect()
-				return
-			}
-			cn.LastSentTo = time.Now()
-		case <-cn.done:
-			return
-		}
+  }`
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(jsonData)))
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
 	}
+	defer resp.Body.Close()
+	// body, err := io.ReadAll(resp.Body)
 }
 
-func (cn *CNode) SendMessage(msg []byte) {
-	select {
-	case cn.sendChan <- msg:
-	default:
-		fmt.Printf("Send buffer full for %s\n", cn.Addr)
+// Run ...
+func (server *Server) Run() {
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", server.host, server.port))
+	if err != nil {
+		log.Fatal(err)
 	}
-}
+	handleCallSeeder()
 
-func (cn *CNode) SendVersionMessage() {
-	message := VersionHeaders{
-		Version:  Version,
-		Services: FullNode,
-		Time:     time.Now(),
-		Addr:     cn.Addr,
-	}
-	buffer := make([]byte, 40)
-	binary.BigEndian.PutUint64(buffer[0:8], uint64(message.Version*100))
-	binary.BigEndian.PutUint64(buffer[8:16], uint64(message.Services))
-	binary.BigEndian.PutUint64(buffer[24:32], uint64(message.Time.Unix()))
-	if tcpAddr, ok := message.Addr.(*net.TCPAddr); ok {
-		// Write IP address
-		copy(buffer[20:36], tcpAddr.IP.To16()) // IPv4 or IPv6
-
-		// Write port
-		binary.BigEndian.PutUint16(buffer[36:38], uint16(tcpAddr.Port))
-	} else {
-		// If it's not a TCP address, fill with zeros
-		fmt.Printf("Warning: Non-TCP address for node %s\n", cn.Addr.String())
-	}
-	cn.SendMessage(buffer)
-
-}
-
-func (cn *CNode) requestDisconnect() {
-	cn.DisconnectRequested = true
-	close(cn.done)
-}
-
-func ThreadSocketHandler(listener net.Listener) {
+	defer listener.Close()
+	//Call Seeder and let them know that we are available for work
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Printf("Accept failed: %v\n", err)
-			continue
+			log.Fatal(err)
 		}
-		fmt.Printf("Accepted connection from %s\n", conn.RemoteAddr())
 
-		node := NewCNode(conn, true)
-		node.Start()
-
-		nodesMutex.Lock()
-		nodes = append(nodes, node)
-		nodesMutex.Unlock()
+		client := &CNode{
+			conn:  conn,
+			VSend: make(chan string),
+		}
+		go client.sendVersionMessage()
+		go client.handleRequest()
+		go client.write()
 	}
 }
 
-func StartNode(port string) error {
-	ln, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		return fmt.Errorf("failed to start listener: %w", err)
-	}
-	go ThreadSocketHandler(ln)
-	return nil
+func (cn *CNode) sendVersionMessage() {
+	version := "0.1"
+	service := "FullNode"
+	when := time.Now()
+	formattedString := fmt.Sprintf("Version: %s, Service: %s, when: %v", version, service, when)
+	cn.VSend <- formattedString
 }
 
-func CleanupNodes() {
-	nodesMutex.Lock()
-	defer nodesMutex.Unlock()
+func (client *CNode) handleRequest() {
+	defer client.conn.Close()
+	reader := bufio.NewReader(client.conn)
 
-	for i := len(nodes) - 1; i >= 0; i-- {
-		if nodes[i].DisconnectRequested {
-			nodes[i].Socket.Close()
-			disconnectedNodes = append(disconnectedNodes, nodes[i])
-			nodes = append(nodes[:i], nodes[i+1:]...)
+	for {
+		message, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from client:", err)
+			return
 		}
+
+		fmt.Printf("Message incoming: %s", message)
 	}
+}
+
+func (cn *CNode) write() {
+	writer := bufio.NewWriter(cn.conn)
+
+	for {
+		msg, ok := <-cn.VSend
+		if !ok {
+			fmt.Println("Channel closed, stopping message sending")
+			return
+		}
+
+		messageToSend := msg + "\n"
+		_, err := writer.WriteString(messageToSend)
+		if err != nil {
+			fmt.Println("Error writing to client:", err)
+			return
+		}
+
+		err = writer.Flush()
+		if err != nil {
+			fmt.Println("Error flushing writer:", err)
+			return
+		}
+		fmt.Println("Message flushed to client")
+	}
+}
+
+func main() {
+	config := Config{
+		Host: "127.0.0.1",
+		Port: "8081",
+	}
+	server := New(&config)
+	server.Run()
 }

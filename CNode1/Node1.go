@@ -16,6 +16,7 @@ import (
 type Server struct {
 	host     string
 	port     string
+	peers    []*CNode
 	listener net.Listener
 }
 
@@ -125,6 +126,7 @@ func (s *Server) Run() {
 			conn:  conn,
 			VSend: make(chan string),
 		}
+		s.peers = append(s.peers, &client)
 		go client.write()
 		go client.handler(conn)
 
@@ -153,13 +155,9 @@ func (cn *CNode) handler(conn net.Conn) {
 		if message == "Ping" {
 			response := "Pong\n"
 			cn.VSend <- response
-			// _, err := conn.Write([]byte(response))
-			// if err != nil {
-			// 	log.Printf("Error sending response: %v", err)
-			// 	return
-			// }
 			log.Printf("Sent: %s", strings.TrimSpace(response))
 		}
+
 	}
 
 	log.Println("Connection closed")

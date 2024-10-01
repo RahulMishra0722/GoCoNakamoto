@@ -115,6 +115,7 @@ func (dm *DBman) IfExistPutInitElseMakeNew(txn Transaction) error {
 	return nil
 }
 
+// * will get called by miner and in turn by server/connmanger to pass it to other peers
 func (dm *DBman) GetMempoolTxns() ([]Transaction, error) {
 	dm.rwMu.Lock()
 	defer dm.rwMu.Unlock()

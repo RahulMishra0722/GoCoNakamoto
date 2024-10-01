@@ -16,11 +16,9 @@ type Addrman struct {
 var once sync.Once
 var instance *Addrman
 
-// will return a singleton
 func GetAddrMan(path string) *Addrman {
 	once.Do(func() {
 		db, err := bbolt.Open(path, 0666, nil)
-
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -31,20 +29,27 @@ func GetAddrMan(path string) *Addrman {
 	})
 	return instance
 }
-func (am *Addrman) Serialize(data []string) ([]byte, error) {
+
+func (am *Addrman) InIt(path string) {
+	GetAddrMan(path)
+}
+
+func (am *Addrman) Serialize(data string) ([]byte, error) {
 	return json.Marshal(data)
 }
-func (am *Addrman) DeSerialize(data []byte) ([]string, error) {
-	var info []string
+
+func (am *Addrman) Deserialize(data []byte) (string, error) {
+	var info string
 	err := json.Unmarshal(data, &info)
 	if err != nil {
 		log.Fatal(err)
-		return nil, err
+		return "", err
 	}
 	return info, nil
 }
-func (am *Addrman) SaveAddr(addr string, info []string) (bool, error) {
-	am.db.Update(func(tx *bbolt.Tx) error {
+
+func (am *Addrman) SaveAddr(addr string, info string) (bool, error) {
+	err := am.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte("Peers"))
 		if err != nil {
 			log.Fatal(err)
@@ -56,20 +61,20 @@ func (am *Addrman) SaveAddr(addr string, info []string) (bool, error) {
 		key := []byte(addr)
 		return bucket.Put(key, data)
 	})
-	return true, nil
+	return err == nil, err
 }
-func (am *Addrman) GetAddr() map[string][]string {
-	peers := make(map[string][]string)
 
+func (am *Addrman) GetAddr() map[string]string {
+	peers := make(map[string]string)
 	am.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte("Peers"))
 		if bucket == nil {
-			log.Fatal("Bucket Doesnt exist")
+			return nil
 		}
 		return bucket.ForEach(func(k, v []byte) error {
-			info, err := am.DeSerialize(v)
+			info, err := am.Deserialize(v)
 			if err != nil {
-				log.Fatal(err)
+				return err
 			}
 			peers[string(k)] = info
 			return nil
@@ -77,6 +82,7 @@ func (am *Addrman) GetAddr() map[string][]string {
 	})
 	return peers
 }
+
 func (am *Addrman) DoesAddrAlreadyExist(key string) bool {
 	var exist bool
 	am.db.View(func(tx *bbolt.Tx) error {
@@ -89,4 +95,8 @@ func (am *Addrman) DoesAddrAlreadyExist(key string) bool {
 		return nil
 	})
 	return exist
+}
+
+func (am *Addrman) Close() {
+	am.db.Close()
 }

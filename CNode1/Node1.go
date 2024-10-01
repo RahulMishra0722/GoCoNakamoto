@@ -10,14 +10,16 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Server represents the server that listens for incoming connections
 type Server struct {
-	host     string
-	port     string
-	peers    []*CNode
-	listener net.Listener
+	host         string
+	port         string
+	peers        []*CNode
+	listener     net.Listener
+	maxPeerLimit int
 }
 
 const (
@@ -30,6 +32,7 @@ type CNode struct {
 	conn             net.Conn
 	VSend            chan string
 	ExchangedVersion bool
+	LastServed       time.Time
 }
 
 // Config represents server configuration
@@ -48,8 +51,7 @@ func New(config *Config) *Server {
 
 // handleCallSeeder sends a request to the seeder to inform it that this node is ready to serve
 func (s *Server) handleCallSeeder() {
-	// For now we'll use the machine's localhost address
-	url := `http://localhost:8080/ReadyToServe`
+	url := `http://localhost:8082/ReadyToServe`
 	jsonData := `{
 		"address": "127.0.0.1:8081",
 		"services": {
@@ -61,18 +63,22 @@ func (s *Server) handleCallSeeder() {
 	if err != nil {
 		fmt.Println("Error sending request to seeder:", err)
 		s.Close()
-		return
+		log.Fatal("Server stopped due to seeder communication failure")
 	}
 	defer resp.Body.Close()
-	// if resp.StatusCode == http.StatusOK {
-	s.getActivePeers()
-	//}
 
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("Unexpected status code from seeder: %d\n", resp.StatusCode)
+		s.Close()
+		log.Fatal("Server stopped due to unexpected response from seeder")
+	}
+
+	go s.getActivePeers()
 }
 
 // getActivePeers sends a request to the seeder to get a list of active peers
 func (s *Server) getActivePeers() {
-	url := `http://localhost:8080/NeedPeers`
+	url := `http://localhost:8082/NeedPeers`
 	jsonData := `{
 		"servicesNeeded": {
 			"doesEverything": true
@@ -82,6 +88,7 @@ func (s *Server) getActivePeers() {
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(jsonData)))
 	if err != nil {
 		fmt.Println("Error getting active peers:", err)
+		s.Close()
 		return
 	}
 	defer resp.Body.Close()
@@ -106,7 +113,7 @@ func (s *Server) getActivePeers() {
 
 // Run starts the server and listens for incoming connections
 func (s *Server) Run() {
-	listener, err := net.Listen("tcp4", "127.0.0.1:8081")
+	listener, err := net.Listen("tcp4", s.host+":"+s.port)
 	if err != nil {
 		log.Fatal("Error starting server:", err)
 	}
@@ -114,7 +121,7 @@ func (s *Server) Run() {
 	defer listener.Close()
 
 	log.Println("Server is running on 127.0.0.1:8081")
-	go s.handleCallSeeder()
+	s.handleCallSeeder()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -167,48 +174,7 @@ func isTransportOver(data string) bool {
 	return strings.HasSuffix(data, StopCharacter)
 }
 
-// func (cn *CNode) handleConnection() {
-// 	defer cn.conn.Close()
-
-// 	var (
-// 		buf = make([]byte, 1024)
-// 		r   = bufio.NewReader(cn.conn)
-// 	)
-
-// ILOOP:
-// 	for {
-// 		n, err := r.Read(buf)
-// 		if err != nil {
-// 			if err == io.EOF {
-// 				break ILOOP
-// 			}
-// 			log.Fatalf("Receive data failed: %s", err)
-// 			return
-// 		}
-
-// 		data := string(buf[:n])
-// 		log.Println("Receive:", data)
-
-// 		// Check if the received message is a Ping
-// 		if strings.TrimSpace(data) == "Ping" {
-// 			log.Printf("Received Ping from %s, sending Pong", cn.conn.RemoteAddr())
-// 			cn.VSend <- "Pong"
-
-// 			log.Printf("Send: %s", Message)
-// 		}
-
-// 		// Check for transport closure
-// 		if isTransportOver(data) {
-// 			break ILOOP
-// 		}
-// 	}
-// }
-
-// func isTransportOver(data string) bool {
-// 	return strings.HasSuffix(data, StopCharacter)
-// }
-
-// // write sends messages to the client
+// write sends messages to the client
 func (cn *CNode) write() {
 	writer := bufio.NewWriter(cn.conn)
 
@@ -247,5 +213,6 @@ func main() {
 	}
 
 	server := New(&config)
+	server.maxPeerLimit = 20
 	server.Run()
 }

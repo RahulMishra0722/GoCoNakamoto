@@ -3,117 +3,180 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
-// Server ...
+// Server represents the server that listens for incoming connections
 type Server struct {
-	host string
-	port string
+	host         string
+	port         string
+	peers        []*CNode
+	listener     net.Listener
+	maxPeerLimit int
 }
 
-// Client ...
+const (
+	Message       = "Pong"
+	StopCharacter = "\r\n\r\n"
+)
+
+// CNode represents a client node in the network
 type CNode struct {
 	conn             net.Conn
 	VSend            chan string
 	ExchangedVersion bool
+	LastServed       time.Time
 }
 
-// Config ...
+// Config represents server configuration
 type Config struct {
 	Host string
 	Port string
 }
 
-//   - - This is the json structure  our seeder expects DoesEverything DoesValidateAndRelay these are optional you only have to send one
-//     var req struct {
-//     Addr     string `json:"address"`
-//     Services struct {
-//     DoesEverything       bool `json:"doesEverything"`
-//     DoesValidateAndRelay bool `json:"doesValidateAndRelay"`
-//     } `json:"services"`
-//     }
-//
-// New ...
+// New initializes a new server with the given configuration
 func New(config *Config) *Server {
 	return &Server{
 		host: config.Host,
 		port: config.Port,
 	}
 }
-func handleCallSeeder() {
 
-	// get your public facing ip
-	// for now we'll use machine's
-	url := `http://localhost:8080/ReadyToServe`
+// handleCallSeeder sends a request to the seeder to inform it that this node is ready to serve
+func (s *Server) handleCallSeeder() {
+	url := `http://localhost:8082/ReadyToServe`
 	jsonData := `{
-	address::8081
-	"services": {
-	  "doesEverything": true
-	}
-  }`
+		"address": "127.0.0.1:8081",
+		"services": {
+			"doesEverything": true
+		}
+	}`
+
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(jsonData)))
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("Error sending request to seeder:", err)
+		s.Close()
+		log.Fatal("Server stopped due to seeder communication failure")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("Unexpected status code from seeder: %d\n", resp.StatusCode)
+		s.Close()
+		log.Fatal("Server stopped due to unexpected response from seeder")
+	}
+
+	go s.getActivePeers()
+}
+
+// getActivePeers sends a request to the seeder to get a list of active peers
+func (s *Server) getActivePeers() {
+	url := `http://localhost:8082/NeedPeers`
+	jsonData := `{
+		"servicesNeeded": {
+			"doesEverything": true
+		}
+	}`
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(jsonData)))
+	if err != nil {
+		fmt.Println("Error getting active peers:", err)
+		s.Close()
 		return
 	}
 	defer resp.Body.Close()
-	// body, err := io.ReadAll(resp.Body)
-}
 
-// Run ...
-func (server *Server) Run() {
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", server.host, server.port))
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("Error reading response body:", err)
+		return
 	}
-	handleCallSeeder()
 
+	var addresses []string
+	err = json.Unmarshal(body, &addresses)
+	if err != nil {
+		fmt.Print(err)
+	}
+	for _, addr := range addresses {
+		//Make addr man and tell it to store it
+		fmt.Print(addr)
+	}
+
+}
+
+// Run starts the server and listens for incoming connections
+func (s *Server) Run() {
+	listener, err := net.Listen("tcp4", s.host+":"+s.port)
+	if err != nil {
+		log.Fatal("Error starting server:", err)
+	}
+	s.listener = listener
 	defer listener.Close()
-	//Call Seeder and let them know that we are available for work
+
+	log.Println("Server is running on 127.0.0.1:8081")
+	s.handleCallSeeder()
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Fatal(err)
+		if s.maxPeerLimit > len(s.peers) {
+			conn, err := listener.Accept()
+			if err != nil {
+				log.Println("Error accepting connection:", err)
+				continue
+			}
+			log.Printf("Connected to %s\n", conn.RemoteAddr())
+			client := CNode{
+				conn:  conn,
+				VSend: make(chan string),
+			}
+			s.peers = append(s.peers, &client)
+			go client.write()
+			go client.handler(conn)
 		}
 
-		client := &CNode{
-			conn:  conn,
-			VSend: make(chan string),
-		}
-		go client.sendVersionMessage()
-		go client.handleRequest()
-		go client.write()
 	}
+
 }
 
-func (cn *CNode) sendVersionMessage() {
-	version := "0.1"
-	service := "FullNode"
-	when := time.Now()
-	formattedString := fmt.Sprintf("Version: %s, Service: %s, when: %v", version, service, when)
-	cn.VSend <- formattedString
-}
-
-func (client *CNode) handleRequest() {
-	defer client.conn.Close()
-	reader := bufio.NewReader(client.conn)
+func (cn *CNode) handler(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
 
 	for {
 		message, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Println("Error reading from client:", err)
+			log.Printf("Error reading from connection: %v", err)
 			return
 		}
 
-		fmt.Printf("Message incoming: %s", message)
+		message = strings.TrimSpace(message)
+		log.Printf("Received: %s", message)
+
+		if isTransportOver(message) {
+			break
+		}
+
+		if message == "Ping" {
+			response := "Pong\n"
+			cn.VSend <- response
+			log.Printf("Sent: %s", strings.TrimSpace(response))
+		}
+
 	}
+
+	log.Println("Connection closed")
 }
 
+func isTransportOver(data string) bool {
+	return strings.HasSuffix(data, StopCharacter)
+}
+
+// write sends messages to the client
 func (cn *CNode) write() {
 	writer := bufio.NewWriter(cn.conn)
 
@@ -124,8 +187,8 @@ func (cn *CNode) write() {
 			return
 		}
 
-		messageToSend := msg + "\n"
-		_, err := writer.WriteString(messageToSend)
+		fmt.Printf("Writing message %s", msg)
+		_, err := writer.Write([]byte(msg))
 		if err != nil {
 			fmt.Println("Error writing to client:", err)
 			return
@@ -140,11 +203,18 @@ func (cn *CNode) write() {
 	}
 }
 
+// Close stops the server listener
+func (s *Server) Close() {
+	s.listener.Close()
+}
+
 func main() {
 	config := Config{
 		Host: "127.0.0.1",
 		Port: "8081",
 	}
+
 	server := New(&config)
+	server.maxPeerLimit = 20
 	server.Run()
 }

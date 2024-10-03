@@ -1,6 +1,7 @@
 package RpcServer
 
 import (
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,11 +11,13 @@ import (
 )
 
 type Transaction struct {
-	TxnHash  string `json:"txnHash"`
-	Sender   string `json:"sender"`
-	Receiver string `json:"receiver"` // Fixed typo in "receiver"
-	Inputs   []UTXO `json:"inputs"`
-	Outputs  []UTXO `json:"outputs"`
+	hash     string
+	sender   ecdsa.PublicKey
+	reciever ecdsa.PublicKey
+	amount   float64
+	Inputs   []TxInput
+	Outputs  []TxOutput
+	LockTime uint32
 }
 type RpcServer struct {
 }

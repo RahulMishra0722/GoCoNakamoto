@@ -35,6 +35,16 @@ type CNode struct {
 	LastServed       time.Time
 }
 
+func NewCNode() CNode {
+	VSend := make(chan string)
+	return CNode{
+		conn:             &net.TCPConn{},
+		VSend:            VSend,
+		ExchangedVersion: false,
+		LastServed:       time.Time{},
+	}
+}
+
 // Config represents server configuration
 type Config struct {
 	Host string
@@ -129,13 +139,12 @@ func (s *Server) Run() {
 			continue
 		}
 		log.Printf("Connected to %s\n", conn.RemoteAddr())
-		client := CNode{
-			conn:  conn,
-			VSend: make(chan string),
-		}
-		s.peers = append(s.peers, &client)
-		go client.write()
-		go client.handler(conn)
+		newNode := NewCNode()
+		newNode.conn = conn
+
+		s.peers = append(s.peers, &newNode)
+		go newNode.write()
+		go newNode.handler(conn)
 
 	}
 

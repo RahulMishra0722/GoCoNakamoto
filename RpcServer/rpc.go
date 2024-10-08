@@ -115,7 +115,7 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	var reqOuter TransactionRequest
 	bodyBytes, _ := ioutil.ReadAll(r.Body)
 	fmt.Printf("Request body: %s\n", bodyBytes)
-	r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes)) // Recreate the body reader
+	r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	err := json.NewDecoder(r.Body).Decode(&reqOuter)
 	if err != nil {

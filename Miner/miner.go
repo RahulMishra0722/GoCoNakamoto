@@ -24,6 +24,11 @@ type Miner struct {
 	DBman *DBMan.DBman
 }
 
+// ! TxnBlock Hash Is empty somethings wrong
+// Todo[] store transactions
+// Todo[] Store blocks and until we are testing make a function to mine a Genesis block on second thought we dont have to until everything is done
+// Todo[] One more feature in wallet currently we clear the whole thing and that looses the public key and that will cause the user to enter public key every transaction
+// Todo[] what would be really fun is a retry function it'll figure out if we should retry and will if we have to given the right conitions
 const (
 	Difficulty = 1
 	Subsidy    = 50 // will get halved every 250000 blocks
@@ -31,15 +36,8 @@ const (
 )
 
 type ProofOfWork struct {
-	block  *Block
+	block  *DBMan.Block
 	Target *big.Int
-}
-
-type Block struct {
-	Height       int
-	Header       DBMan.BlockHeader   // The block header
-	Hash         string              // Hash of the block
-	Transactions []DBMan.Transaction // List of other transactions in the block
 }
 
 func int64ToBytes(num int64) []byte {
@@ -94,7 +92,6 @@ func (m *Miner) CreateCoinbaseTransaction() (DBMan.Transaction, string, string, 
 	}
 
 	output := DBMan.TxOutput{
-
 		Value:        Subsidy,
 		ScriptPubKey: publicKey,
 	}
@@ -116,7 +113,8 @@ func (m *Miner) CreateCoinbaseTransaction() (DBMan.Transaction, string, string, 
 	if err != nil {
 		fmt.Print(err)
 	}
-
+	//*Mental note i think i should calculate the txn hash just before adding to block
+	//!Mental note i think i should calculate the txn hash just before adding to block
 	utxo.Id = doubleSHA256(buff.Bytes())
 	coinBaseTxn.Outputs = append(coinBaseTxn.Outputs, utxo)
 	return coinBaseTxn, publicKey, privateKey, utxo, nil
@@ -236,7 +234,7 @@ func (m *Miner) ConvertTransactionsToByteArray(transactions []DBMan.Transaction)
 	}
 	return transactionInBytes
 }
-func (m *Miner) NewBlock(merkelRoot string, Transactions []DBMan.Transaction) (*Block, string, string, DBMan.Utxo, []string, error) {
+func (m *Miner) NewBlock(merkelRoot string, Transactions []DBMan.Transaction) (*DBMan.Block, string, string, DBMan.Utxo, []string, error) {
 	fmt.Println("Mining starts")
 	var successFullyMinedTransactions []string
 	var ToBeAddedBlockTransactions []DBMan.Transaction
@@ -244,7 +242,7 @@ MainLoop:
 	for _, txn := range Transactions {
 		isValid, err := ValidateSignature(txn.Sender, txn.TxnHash, txn.Signature)
 		if err != nil {
-			return &Block{}, "", "", DBMan.Utxo{}, []string{}, fmt.Errorf("invalid txn Signature verification falled with err: %v", err)
+			return &DBMan.Block{}, "", "", DBMan.Utxo{}, []string{}, fmt.Errorf("invalid txn Signature verification falled with err: %v", err)
 		}
 		//Todo check if the utxo's even exist
 		if isValid {
@@ -368,7 +366,7 @@ MainLoop:
 				successFullyMinedTransactions = append(successFullyMinedTransactions, txn.TxnHash)
 
 			} else {
-				return &Block{}, "", "", DBMan.Utxo{}, []string{}, fmt.Errorf("insufficient balance")
+				return &DBMan.Block{}, "", "", DBMan.Utxo{}, []string{}, fmt.Errorf("insufficient balance")
 			}
 		}
 
@@ -382,8 +380,8 @@ MainLoop:
 	Prevhash, err := m.DBman.GetPrevHash()
 	if err != nil {
 		fmt.Println(err)
+		Prevhash = onTransactionEmpty()
 	}
-	ToBeAddedBlockTransactions = append([]DBMan.Transaction{cbaseTxn}, ToBeAddedBlockTransactions...)
 
 	blockHeader := DBMan.BlockHeader{
 		Version:       CurVersion,
@@ -393,33 +391,44 @@ MainLoop:
 		Bits:          Difficulty,
 		Nonce:         0,
 	}
+	Hash := HashBlock(blockHeader, cbaseTxn)
 
-	block := &Block{
+	// for _, txn := range ToBeAddedBlockTransactions {
+	// 	txn.BlockHash = Hash
+	// }
+	cbaseTxn.TxnHash = cbaseTxn.CalculateHash() // Update txn hash before adding to the block
+	cbaseTxn.BlockHash = Hash
+
+	ToBeAddedBlockTransactions = append([]DBMan.Transaction{cbaseTxn}, ToBeAddedBlockTransactions...)
+
+	block := &DBMan.Block{
 		Height:       0,
 		Header:       blockHeader,
 		Transactions: ToBeAddedBlockTransactions,
-		Hash:         "",
+		Hash:         Hash,
 	}
 
 	pow := NewProofOfWork(block)
-	nonce, hash := pow.Run()
+	nonce, _ := pow.Run()
 
 	block.Header.Nonce = nonce
 
-	block.Hash = hex.EncodeToString(hash[:])
 	cbaseTxn.BlockHash = block.Hash
-
 	// fmt.Print(cbaseTxn.BlockHash)
 
 	if !pow.Validate() {
 		fmt.Println("Invalid block: Proof of Work validation failed")
 		os.Exit(1)
 	}
+	for _, txn := range ToBeAddedBlockTransactions {
+		fmt.Printf("Transactions are  being Stored currently storing %v\n", txn.TxnHash)
+		m.DBman.StoreTransactions(txn.TxnHash, txn)
+	}
 
 	return block, minerPublicKey, minerPrivatekey, coinbaseUtxo, successFullyMinedTransactions, nil
 }
 
-func NewProofOfWork(block *Block) *ProofOfWork {
+func NewProofOfWork(block *DBMan.Block) *ProofOfWork {
 	target := big.NewInt(1)
 	target.Lsh(target, uint(256-block.Header.Bits))
 	return &ProofOfWork{block: block, Target: target}
@@ -476,7 +485,7 @@ func onTransactionEmpty() string {
 	return strings.Repeat("0", 64)
 }
 
-func (m *Miner) MineBlock() (*Block, string, string, DBMan.Utxo, []string) {
+func (m *Miner) MineBlock() (*DBMan.Block, string, string, DBMan.Utxo, []string) {
 	// maybe we'll call all the nodes and ask for txns and also get it from mempool if there arent any meaning we'd have to mine an empty block which is fine
 	//in newwer blockchains
 	// we gotta distribute the keys somehow
@@ -541,9 +550,10 @@ func main() {
 		fmt.Print(err)
 	}
 
-	// Mine a block and retrieve coinbase UTXO
+	//Mine a block and retrieve coinbase UTXO
 
-	_, _, _, coinbaseUtxo, successFullyMinedTransactions := miner.MineBlock()
+	block, _, _, coinbaseUtxo, successFullyMinedTransactions := miner.MineBlock()
+	miner.DBman.StoreBlock(*block, block.Hash)
 
 	// // coinbaseUtxo.Output.ScriptPubKey = []byte("03f614928ce8b1200e2bebdf4ae871467dc3d9b3961381e487424a5c45fe843a70")//test working
 	for _, txnHash := range successFullyMinedTransactions {
@@ -553,6 +563,33 @@ func main() {
 	if err != nil {
 		fmt.Print(err)
 	}
+	// txn, err := miner.DBman.GetTransactions("109154696d92897ad1b47131e449d3d6e7bcf928f5903f904d37e74c8a17e519")
+	// if err != nil {
+	// 	fmt.Print(err)
+	// }
+	// fmt.Printf("  Txn Hash:      %v\n", txn.TxnHash)
+	// fmt.Printf("  Block Hash:    %v\n", txn.BlockHash)
+	// fmt.Printf("  Is Coinbase:   %v\n", txn.IsCoinbase)
+	// fmt.Printf("  Miner Subsidy: %v\n", txn.Subsidy)
+	// if txn.IsCoinbase {
+	// 	fmt.Print("No Inputs Since its a CoinBase Txn\n")
+	// } else {
+	// 	fmt.Println("  Outputs:")
+	// 	for _, otpt := range txn.Outputs {
+	// 		fmt.Printf("    Output ID:              %v\n", otpt.Id)
+	// 		fmt.Printf("    Previous Output Hash:   %v\n", otpt.PreviousOutput.Hash)
+	// 		fmt.Printf("    Output Value:           %v\n", otpt.Output.Value)
+	// 		fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
+	// 	}
+	// }
+	// fmt.Println("  Outputs:")
+	// for _, otpt := range txn.Outputs {
+	// 	fmt.Printf("    Output ID:              %v\n", otpt.Id)
+	// 	fmt.Printf("    Previous Output Hash:   %v\n", otpt.PreviousOutput.Hash)
+	// 	fmt.Printf("    Output Value:           %v\n", otpt.Output.Value)
+	// 	fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
+	// }
+	// fmt.Println("  -----------------------------")
 
 	// if err != nil {
 	// 	fmt.Print(err)

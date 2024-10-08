@@ -1,63 +1,100 @@
-// package types
+package main
 
-// import (
-// 	"crypto/ecdsa"
-// 	"time"
-// )
+import (
+	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 
-// type GetBalance struct {
-// 	Address string `json:"address"`
-// }
-// type GetBalanceResponse struct {
-// 	Balance float64 `json:"balance"`
-// }
-// type CoinbaseTransaction struct {
-// 	ID        string  // Unique identifier for the coinbase transaction
-// 	Amount    float64 // Amount awarded to the miner
-// 	Miner     string  // Address of the miner (newly generated)
-// 	Signature string  // Signature for the coinbase transaction
-// }
+	"github.com/btcsuite/btcd/btcec"
+)
 
-// // BlockHeader represents the structure of a simplified block header
+func PrivKeyToHex(privKey *ecdsa.PrivateKey) string {
+	return fmt.Sprintf("%064x", privKey.D) // Ensure 32 byte (64 hex char) representation
+}
 
-// type BlockHeader struct {
-// 	Version       int
-// 	PrevBlockHash string
-// 	MerkleRoot    string
-// 	Timestamp     time.Time
-// 	Bits          int   // Difficulty target
-// 	Nonce         int64 // The value we are trying to find
-// }
+func PubKeyToHex(pubKeyBytes []byte) string {
+	return hex.EncodeToString(pubKeyBytes)
+}
 
-// // Transaction represents a Bitcoin transaction
-// type Transaction struct {
-// 	hash     string
-// 	Version  int32
-// 	Inputs   []TxInput
-// 	Outputs  []TxOutput
-// 	LockTime uint32
-// }
+func GenerateKeys() (string, string, error) {
+	privateKey, err := btcec.NewPrivateKey(btcec.S256())
+	if err != nil {
+		return "", "", err
+	}
 
-// // TxInput represents an input of a Bitcoin transaction
-// type TxInput struct {
-// 	PreviousOutput OutPoint
-// 	publickey      ecdsa.PublicKey
-// }
+	ecdsaPrivKey := privateKey.ToECDSA()
+	compressedPubKey := privateKey.PubKey().SerializeCompressed()
+	priv := PrivKeyToHex(ecdsaPrivKey)
+	pub := PubKeyToHex(compressedPubKey)
+	return priv, pub, nil
+}
 
-// // TxOutput represents an output of a Bitcoin transaction
-// type TxOutput struct {
-// 	Value     int64
-// 	publickey ecdsa.PublicKey
-// }
+func SignMessage(privKeyHex string, message string) (string, error) {
+	privKeyBytes, err := hex.DecodeString(privKeyHex)
+	if err != nil {
+		return "", fmt.Errorf("error decoding private key: %v", err)
+	}
 
-// // OutPoint references a specific output in a previous transaction
-// type OutPoint struct {
-// 	Hash  []byte
-// 	Index uint32
-// }
-// type Block struct {
-// 	Header       BlockHeader         // The block header
-// 	Coinbase     CoinbaseTransaction // The coinbase transaction
-// 	Hash         string              // Hash of the block
-// 	Transactions []Transaction       // List of other transactions in the block
-// }
+	privKey, _ := btcec.PrivKeyFromBytes(btcec.S256(), privKeyBytes)
+
+	messageHash := sha256.Sum256([]byte(message))
+
+	signature, err := privKey.Sign(messageHash[:])
+	if err != nil {
+		return "", fmt.Errorf("error signing message: %v", err)
+	}
+
+	return hex.EncodeToString(signature.Serialize()), nil
+}
+
+func VerifySignature(pubKeyHex string, message string, signatureHex string) (bool, error) {
+	pubKeyBytes, err := hex.DecodeString(pubKeyHex)
+	if err != nil {
+		return false, fmt.Errorf("error decoding public key: %v", err)
+	}
+	pubKey, err := btcec.ParsePubKey(pubKeyBytes, btcec.S256())
+	if err != nil {
+		return false, fmt.Errorf("error parsing public key: %v", err)
+	}
+
+	messageHash := sha256.Sum256([]byte(message))
+
+	signatureBytes, err := hex.DecodeString(signatureHex)
+	if err != nil {
+		return false, fmt.Errorf("error decoding signature: %v", err)
+	}
+
+	signature, err := btcec.ParseSignature(signatureBytes, btcec.S256())
+	if err != nil {
+		return false, fmt.Errorf("error parsing signature: %v", err)
+	}
+
+	return signature.Verify(messageHash[:], pubKey), nil
+}
+
+func main() {
+	privKey, pubKey, err := GenerateKeys()
+	if err != nil {
+		fmt.Println("Error generating keys:", err)
+		return
+	}
+
+	fmt.Println("Private Key:", privKey)
+	fmt.Println("Compressed Public Key:", pubKey)
+
+	message := "Hello, World!"
+	signature, err := SignMessage(privKey, message)
+	if err != nil {
+		fmt.Println("Error signing message:", err)
+		return
+	}
+	fmt.Println("Signature:", signature)
+
+	isValid, err := VerifySignature(pubKey, message, signature)
+	if err != nil {
+		fmt.Println("Error verifying signature:", err)
+		return
+	}
+	fmt.Println("Signature is valid:", isValid)
+}

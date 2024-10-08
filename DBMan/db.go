@@ -107,6 +107,7 @@ type TxOutput struct {
 }
 
 type Block struct {
+	Height       int
 	Header       BlockHeader   // The block header
 	Hash         string        // Hash of the block
 	Transactions []Transaction // List of other transactions in the block
@@ -132,88 +133,6 @@ func DeSeralizeUnserialisableData(input []byte, output interface{}) error {
 }
 
 // Todo Come back to this one filet is missing
-func (txn Transaction) SerializeTxn() ([]byte, error) {
-	var serialize bytes.Buffer
-
-	// Serialize the Receiver with length prefix
-	if err := binary.Write(&serialize, binary.LittleEndian, int32(len(txn.Receiver))); err != nil {
-		return nil, err
-	}
-	// serialize.Write(txn.Receiver)
-
-	if err := binary.Write(&serialize, binary.LittleEndian, int32(txn.Amount)); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(&serialize, binary.LittleEndian, int32(txn.LockTime)); err != nil {
-		return nil, err
-	}
-
-	if txn.IsCoinbase {
-		if err := binary.Write(&serialize, binary.LittleEndian, int32(txn.Subsidy)); err != nil {
-			return nil, err
-		}
-	}
-
-	bh, err := SerializeUnserializableData(txn.BlockHash)
-	if err != nil {
-		return nil, err
-	}
-	serialize.Write(bh)
-
-	outputs, err := SerializeUnserializableData(txn.Outputs)
-	if err != nil {
-		return nil, err
-	}
-	serialize.Write(outputs)
-
-	sig, err := SerializeUnserializableData(txn.Signature)
-	if err != nil {
-		return nil, err
-	}
-	serialize.Write(sig)
-
-	return serialize.Bytes(), nil
-}
-
-func (txn *Transaction) DeSerializeTxn(data []byte) error {
-	buf := bytes.NewReader(data)
-
-	var receivedLen int32
-	if err := binary.Read(buf, binary.LittleEndian, &receivedLen); err != nil {
-		return err
-	}
-	var amount float32
-	var lockTime int32
-	if err := binary.Read(buf, binary.LittleEndian, &amount); err != nil {
-		return err
-	}
-	txn.Amount = float64(amount)
-	if err := binary.Read(buf, binary.LittleEndian, &lockTime); err != nil {
-		return err
-	}
-	txn.LockTime = uint32(lockTime)
-	if err := binary.Read(buf, binary.LittleEndian, &txn.IsCoinbase); err != nil {
-		return err
-	}
-	if txn.IsCoinbase {
-		var subsidy float64
-		if err := binary.Read(buf, binary.LittleEndian, &subsidy); err != nil {
-			return err
-		}
-		txn.Subsidy = subsidy
-	}
-	var bh []byte
-	if err := gob.NewDecoder(buf).Decode(&bh); err != nil {
-		return err
-	}
-	txn.BlockHash = string(bh)
-	var sig []byte
-	if err := gob.NewDecoder(buf).Decode(&sig); err != nil {
-		return err
-	}
-	txn.Signature = string(sig)
-	return nil
-}
 
 func DeserializeTxn(data []byte) ([]Transaction, error) {
 	var retrievedTransactions []Transaction
@@ -408,6 +327,69 @@ func (dm *DBman) GetPrevHash() (string, error) {
 
 	return prevHash, nil
 }
+func (dm *DBman) LogAllTheBlocks() error {
+	err := dm.db.View(func(tx *bbolt.Tx) error {
+		bucketName := []byte("Blocks")
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			return fmt.Errorf("error occurred: bucket %s does not exist", bucketName)
+		}
+
+		cursor := bucket.Cursor()
+		var index int
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			index++
+			var buff bytes.Buffer
+			buff.Write(v)
+			decoder := gob.NewDecoder(&buff)
+			var block Block
+			if err := decoder.Decode(&block); err != nil {
+				return fmt.Errorf("failed to decode block: %v", err)
+			}
+
+			// Pretty print the block information
+			fmt.Printf("\n==================== Block %d ====================\n", index)
+			fmt.Printf("Hash:            %s\n", block.Hash)
+			fmt.Printf("Difficulty:      %v\n", block.Header.Bits)
+			fmt.Printf("Nonce:           %v\n", block.Header.Nonce)
+			fmt.Printf("Merkle Root:     %s\n", block.Header.MerkleRoot)
+			fmt.Printf("Previous Hash:   %s\n", block.Header.PrevBlockHash)
+			fmt.Printf("Version:         %v\n", block.Header.Version)
+			fmt.Printf("Block Height:    %v\n", block.Height)
+
+			fmt.Println("\nTransactions:")
+			for _, txn := range block.Transactions {
+				fmt.Printf("  Txn Hash:      %v\n", txn.TxnHash)
+				fmt.Printf("  Block Hash:    %v\n", txn.BlockHash)
+				fmt.Printf("  Is Coinbase:   %v\n", txn.IsCoinbase)
+				fmt.Printf("  Miner Subsidy: %v\n", txn.Subsidy)
+				if txn.IsCoinbase {
+					fmt.Print("No Inputs Since its a CoinBase Txn\n")
+				} else {
+					fmt.Println("  Outputs:")
+					for _, otpt := range txn.Outputs {
+						fmt.Printf("    Output ID:              %v\n", otpt.Id)
+						fmt.Printf("    Previous Output Hash:   %v\n", otpt.PreviousOutput.Hash)
+						fmt.Printf("    Output Value:           %v\n", otpt.Output.Value)
+						fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
+					}
+				}
+				fmt.Println("  Outputs:")
+				for _, otpt := range txn.Outputs {
+					fmt.Printf("    Output ID:              %v\n", otpt.Id)
+					fmt.Printf("    Previous Output Hash:   %v\n", otpt.PreviousOutput.Hash)
+					fmt.Printf("    Output Value:           %v\n", otpt.Output.Value)
+					fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
+				}
+				fmt.Println("  -----------------------------")
+			}
+
+			fmt.Println("==================================================\n")
+		}
+		return nil
+	})
+	return err
+}
 
 func (dm *DBman) StoreBlock(block Block, hash string) error {
 	var buffer bytes.Buffer
@@ -481,13 +463,59 @@ func (dm *DBman) StoreTransactions(hash string, txn Transaction) error {
 			return fmt.Errorf("create bucket: %w", err)
 		}
 
-		serialized, err := txn.SerializeTxn()
-		if err != nil {
+		var buff bytes.Buffer
+
+		encoder := gob.NewEncoder(&buff)
+		if err = encoder.Encode(txn); err != nil {
 			return fmt.Errorf("serialize transaction: %w", err)
 		}
+
 		key := []byte(hash)
-		return bucket.Put(key, serialized)
+		return bucket.Put(key, buff.Bytes())
 	})
+}
+func (dm *DBman) TransactionLogger() error {
+	err := dm.db.View(func(tx *bbolt.Tx) error {
+		bucketName := []byte("Transactions")
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			return fmt.Errorf("bucket with name %s does not yet exist", bucketName)
+		}
+		cursor := bucket.Cursor()
+
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			var txn Transaction
+			var buff bytes.Buffer
+			buff.Write(v)
+			decoder := gob.NewDecoder(&buff)
+			decoder.Decode(&txn)
+			fmt.Printf("  Txn Hash:      %v\n", txn.TxnHash)
+			fmt.Printf("  Block Hash:    %v\n", txn.BlockHash)
+			fmt.Printf("  Is Coinbase:   %v\n", txn.IsCoinbase)
+			fmt.Printf("  Miner Subsidy: %v\n", txn.Subsidy)
+			if txn.IsCoinbase {
+				fmt.Print("No Inputs Since its a CoinBase Txn\n")
+			} else {
+				fmt.Println("  Outputs:")
+				for _, otpt := range txn.Outputs {
+					fmt.Printf("    Output ID:              %v\n", otpt.Id)
+					fmt.Printf("    Previous Output Hash:   %v\n", otpt.PreviousOutput.Hash)
+					fmt.Printf("    Output Value:           %v\n", otpt.Output.Value)
+					fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
+				}
+			}
+			fmt.Println("  Outputs:")
+			for _, otpt := range txn.Outputs {
+				fmt.Printf("    Output ID:              %v\n", otpt.Id)
+				fmt.Printf("    Previous Output Hash:   %v\n", otpt.PreviousOutput.Hash)
+				fmt.Printf("    Output Value:           %v\n", otpt.Output.Value)
+				fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
+			}
+			fmt.Println("  -----------------------------")
+		}
+		return nil
+	})
+	return err
 }
 func (dm *DBman) GetTransactions(hash string) (Transaction, error) {
 	dm.rwMu.Lock()
@@ -499,13 +527,16 @@ func (dm *DBman) GetTransactions(hash string) (Transaction, error) {
 		if bucket == nil {
 			return fmt.Errorf("bucket with name %s doesnt exists", bucketName)
 		}
+
 		key := []byte(hash)
 		txn := bucket.Get(key)
 
 		if txn == nil {
 			return fmt.Errorf("bucket Transaction does not have a transaction with hash %s doesnt exists", hash)
 		}
-		err := deserializedTxn.DeSerializeTxn(txn)
+		var buff = bytes.NewBuffer(txn)
+		decoder := gob.NewDecoder(buff)
+		err := decoder.Decode(&deserializedTxn)
 		if err != nil {
 			return fmt.Errorf("error deserializing the transaction %s", err)
 		}

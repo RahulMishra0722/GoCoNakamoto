@@ -1,22 +1,28 @@
-package main
+package RpcServer
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 
 	"github.com/RahulMishra0722/GC/DBMan"
+	"github.com/RahulMishra0722/GC/Server"
 )
 
 type RpcServer struct {
+	Connman *Server.Server
+	DBman   *DBMan.DBman
 }
-
 type GetBalance struct {
 	PrivateKey string `json:"PrivateKey"`
 }
 
+func NewRpcServer(server *Server.Server, DB *DBMan.DBman) *RpcServer {
+	return &RpcServer{
+		Connman: server,
+		DBman:   DB,
+	}
+}
 func (rpc *RpcServer) GetBalanceHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -40,12 +46,9 @@ func (rpc *RpcServer) GetBalanceHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Get balance from the DB based on the PrivateKey
-	db, err := DBMan.GetDB()
-	if err != nil {
-		fmt.Print(err)
-	}
+	//Todo get it as a dependecy im going insane
 
-	balance, utxo, err := db.GetBalance(privateKey)
+	balance, utxo, err := rpc.DBman.GetBalance(privateKey)
 	if err != nil {
 		fmt.Print(err)
 		http.Error(w, "Failed to fetch balance", http.StatusInternalServerError)
@@ -62,34 +65,8 @@ func (rpc *RpcServer) GetBalanceHandler(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(response)
 }
 
-type Transaction struct {
-	BlockHash string  `json:"BlockHash"`
-	TxnHash   string  `json:"TxnHash"`
-	Sender    string  `json:"Sender"`
-	Receiver  string  `json:"Receiver"`
-	Signature string  `json:"Signature"`
-	Amount    float64 `json:"Amount"`
-	Inputs    []struct {
-		Id             string `json:"Id"`
-		PreviousOutput struct {
-			Hash  string `json:"Hash"`
-			Index int    `json:"Index"`
-		} `json:"PreviousOutput"`
-		Output struct {
-			Value        float64 `json:"Value"`
-			ScriptPubKey string  `json:"ScriptPubKey"`
-		} `json:"Output"`
-	} `json:"Inputs"`
-	Outputs    []interface{} `json:"Outputs"`
-	LockTime   int           `json:"LockTime"`
-	IsCoinbase bool          `json:"IsCoinbase"`
-	Height     int           `json:"Height"`
-	Subsidy    int           `json:"Subsidy"`
-	Fee        float64       `json:"Fee"`
-}
-
 type TransactionRequest struct {
-	Transaction Transaction `json:"Transaction"`
+	Transaction DBMan.Transaction `json:"Transaction"`
 }
 
 func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
@@ -113,9 +90,9 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var reqOuter TransactionRequest
-	bodyBytes, _ := ioutil.ReadAll(r.Body)
-	fmt.Printf("Request body: %s\n", bodyBytes)
-	r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+	// bodyBytes, _ := ioutil.ReadAll(r.Body)
+	// fmt.Printf("Request body: %s\n", bodyBytes)
+	// r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	err := json.NewDecoder(r.Body).Decode(&reqOuter)
 	if err != nil {
@@ -123,11 +100,15 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Now we can access the actual Transaction object
 	req := reqOuter.Transaction
-	db, err := DBMan.GetDB()
-	//Todo close the db after use it hangs the db in place and thus cant mine
-	db.AddToMempool(req.TxnHash, req)
+
+	err, stored := rpc.Connman.StoreInMempoolAndRelay(req)
+	if !stored {
+		response := map[string]interface{}{
+			"Response": fmt.Sprintf("Errror adding Transaction to the meempool Node Responded with Error: %v", err),
+		}
+		json.NewEncoder(w).Encode(response)
+	}
 
 	if err != nil {
 		http.Error(w, "Error Adding Transaction to mempool", http.StatusInternalServerError)
@@ -142,13 +123,5 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func main() {
-	rpc := RpcServer{}
-	router := http.NewServeMux()
-	router.HandleFunc("/GetBalance", rpc.GetBalanceHandler)
-	router.HandleFunc("/Send", rpc.SendTransaction)
-	err := http.ListenAndServe(":8087", router)
-	if err != nil {
-		fmt.Print(err)
-	}
-}
+// for transactions to be propogated through correctly without making the code ugly / re intailzing server to avoid we'd have to do this
+// * --> Rpc -> Call a function inside server / Connman and that in turn calls DBMan to store in db so [--> RpcServer --> Server --> DBMan]

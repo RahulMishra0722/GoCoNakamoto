@@ -2,6 +2,7 @@ package DBMan
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/binary"
@@ -11,8 +12,9 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
+	"strings"
 	"sync"
-	"time"
 
 	"go.etcd.io/bbolt"
 )
@@ -40,45 +42,13 @@ func btoi(b []byte) int {
 	return int(binary.BigEndian.Uint64(b))
 }
 
-func GetDB(path string) (*DBman, error) {
-	if instance == nil {
-		dbMutex.Lock()
-		defer dbMutex.Unlock()
-
-		if instance == nil {
-			var err error
-			once.Do(func() {
-				db, openErr := bbolt.Open("../../testDB", 0666, nil)
-				if openErr != nil {
-					err = fmt.Errorf("failed to open database: %w", openErr)
-					return
-				}
-				instance = &DBman{
-					db: db,
-				}
-			})
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	if instance == nil || instance.db == nil {
-		return nil, fmt.Errorf("database is not initialized properly")
-	}
-
-	return instance, nil
-}
-
-// BlockHeader represents the structure of a simplified block header
-
 type BlockHeader struct {
 	Version       float64
 	PrevBlockHash string
 	MerkleRoot    string
-	Timestamp     time.Time
-	Bits          int   // Difficulty target
-	Nonce         int64 // The value we are trying to find
+	Timestamp     int64
+	Bits          int  // Difficulty target
+	Nonce         uint // The value we are trying to find
 }
 
 type Transaction struct {
@@ -95,6 +65,16 @@ type Transaction struct {
 	Height     uint32  // Block height for the coinbase transaction
 	Subsidy    float64 // Mining subsidy amount for the coinbase transaction
 	Fee        float64
+}
+
+type BlockTemplate struct {
+	PrevBlockHash string        `json:"previousBlockHash"`
+	Bits          int           `json:"bits"`
+	Height        int           `json:"height"`
+	MerkleRoot    string        `json:"merkleRoot"`
+	Timestamp     int64         `json:"timeStamp"`
+	Transactions  []Transaction `json:"transactions"`
+	Version       float64       `json:"version"`
 }
 
 // TxInput represents an input of a Bitcoin transaction
@@ -115,7 +95,7 @@ type Utxo struct {
 }
 
 type TxOutput struct {
-	Value        float64 // Amount in satoshis (1 BTC = 100,000,000 satoshis) well  wont take this route of manging floats ut gets trick very fast
+	Value        float64 // Amount in satoshis (1 BTC = 100,000,000 satoshis) well  wont take this route of manging floats it gets trick very fast
 	ScriptPubKey string  // Locking script, setting conditions to spend this output (e.g., requires a signature)
 }
 
@@ -124,6 +104,7 @@ type Block struct {
 	Header       BlockHeader   // The block header
 	Hash         string        // Hash of the block
 	Transactions []Transaction // List of other transactions in the block
+	Difficulty   int
 }
 
 func SerializeUnserializableData(input interface{}) ([]byte, error) {
@@ -168,6 +149,212 @@ func DeserializeMempool(data []byte) (Transaction, error) {
 func SerializeUtxo(utxo Utxo) ([]byte, error) {
 	return json.Marshal(utxo)
 }
+func GetDB() (*DBman, error) {
+	if instance == nil {
+		dbMutex.Lock()
+		defer dbMutex.Unlock()
+
+		if instance == nil {
+			var err error
+			once.Do(func() {
+				db, openErr := bbolt.Open("../../testDB", 0666, nil)
+				if openErr != nil {
+					err = fmt.Errorf("failed to open database: %w", openErr)
+					return
+				}
+				instance = &DBman{
+					db: db,
+				}
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if instance == nil || instance.db == nil {
+		return nil, fmt.Errorf("database is not initialized properly")
+	}
+
+	return instance, nil
+}
+
+func (dm *DBman) GenerateGenesisBlock() (*Block, Transaction, error) {
+
+	genesisMinerPubkey := "020eb83857e3e0778ca6377b1fa171cf6e5f36ce0de59c72874e96086b99c32048"
+
+	coinbaseTx := Transaction{
+		BlockHash: "",
+		TxnHash:   "020eb83857e3e0778ca6377b1fa171cf6e5f36ce0de59c72874e96086b99c32048",
+		Sender:    "",
+		Receiver:  genesisMinerPubkey,
+		Signature: "",
+		Amount:    50.0,
+		Inputs:    []Utxo{},
+		Outputs: []Utxo{
+			{
+				Id: "020eb83857e3e0778ca6377b1fa171cf6e5f36ce0de59c72874e96086b99c32048",
+				PreviousOutput: OutPoint{
+					Hash:  "",
+					Index: 0,
+				},
+				Output: TxOutput{
+					Value:        50.0,
+					ScriptPubKey: "020eb83857e3e0778ca6377b1fa171cf6e5f36ce0de59c72874e96086b99c32048",
+				},
+			},
+		},
+		LockTime:   0,
+		IsCoinbase: true,
+		Height:     1,
+		Subsidy:    50.0,
+		Fee:        0,
+	}
+	header := BlockHeader{
+		Version:       1.0,
+		PrevBlockHash: "0000000000000000000000000000000000000000000000000000000000000000",
+		MerkleRoot:    "",
+		Timestamp:     0,
+		Bits:          0x1d00ffff,
+		Nonce:         0,
+	}
+
+	block := &Block{
+		Height:       1,
+		Header:       header,
+		Hash:         "",
+		Transactions: []Transaction{coinbaseTx},
+	}
+	// // Blockerr := dm.SetBlockHeight()
+	// if Blockerr != nil {
+	// 	return &Block{}, Transaction{}, fmt.Errorf("error Storing block height %w", Blockerr)
+	// }
+
+	merkleRoot := CalculateMerkleRoot(block.Transactions)
+	block.Header.MerkleRoot = merkleRoot
+
+	blockHash := CalculateBlockHash(block.Header)
+	fmt.Println("Genesis Block hash %s", blockHash)
+	block.Hash = blockHash
+
+	block.Transactions[0].BlockHash = blockHash
+
+	txHash := CalculateTransactionHash(block.Transactions[0])
+	block.Transactions[0].TxnHash = txHash
+
+	return block, coinbaseTx, nil
+}
+
+func CalculateMerkleRoot(transactions []Transaction) string {
+	if len(transactions) == 0 {
+		return ""
+	}
+
+	hashes := make([][]byte, len(transactions))
+	for i, tx := range transactions {
+		hash := sha256.Sum256([]byte(tx.TxnHash))
+		hashes[i] = hash[:]
+	}
+
+	for len(hashes) > 1 {
+		if len(hashes)%2 != 0 {
+			hashes = append(hashes, hashes[len(hashes)-1])
+		}
+
+		newLevel := make([][]byte, 0, len(hashes)/2)
+		for i := 0; i < len(hashes); i += 2 {
+			concatenated := append(hashes[i], hashes[i+1]...)
+			hash := sha256.Sum256(concatenated)
+			newLevel = append(newLevel, hash[:])
+		}
+
+		hashes = newLevel
+	}
+
+	return hex.EncodeToString(hashes[0])
+}
+func PrivKeyToHex(privKey *ecdsa.PrivateKey) string {
+	return fmt.Sprintf("%064x", privKey.D)
+}
+func PubKeyToHex(pubKeyBytes []byte) string {
+	return hex.EncodeToString(pubKeyBytes)
+}
+
+func CalculateBlockHash(header BlockHeader) string {
+	headerBytes := []byte(fmt.Sprintf("%f%s%s%d%d%d",
+		header.Version,
+		header.PrevBlockHash,
+		header.MerkleRoot,
+		header.Timestamp,
+		header.Bits,
+		header.Nonce,
+	))
+
+	hash := sha256.Sum256(headerBytes)
+	return hex.EncodeToString(hash[:])
+}
+
+func CalculateTransactionHash(tx Transaction) string {
+	txBytes := []byte(fmt.Sprintf("%s%s%s%f%d%d%f%f",
+		tx.Sender,
+		tx.Receiver,
+		tx.Signature,
+		tx.Amount,
+		tx.LockTime,
+		tx.Height,
+		tx.Subsidy,
+		tx.Fee,
+	))
+
+	hash := sha256.Sum256(txBytes)
+	return hex.EncodeToString(hash[:])
+}
+
+func InitDB() (*DBman, error) {
+	db, err := GetDB()
+	if err != nil {
+		fmt.Printf("error occured Initialising the DBMan")
+	}
+	err = db.db.Update(func(tx *bbolt.Tx) error {
+		buckets := []string{"BlockHeight", "Transactions", "prev_hash", "MemPoolTransactions", "UTXO", "Blocks"}
+		for _, bucketName := range buckets {
+			_, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+			if err != nil {
+				return fmt.Errorf("error creating %s bucket: %w", bucketName, err)
+			}
+			fmt.Printf("%s bucket created or already exists\n", bucketName)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return &DBman{}, fmt.Errorf("error occured initialising Buckets %w", err)
+	}
+
+	block, coinbaseTx, err := db.GenerateGenesisBlock()
+	if err != nil {
+		return &DBman{}, fmt.Errorf("error generating Genesis Block : %w", err)
+	}
+	StoreBlockerr := db.StoreBlock(*block)
+	if StoreBlockerr != nil {
+		return &DBman{}, fmt.Errorf("error Storing block %w", StoreBlockerr)
+	}
+	Txnerr := db.StoreTransaction(coinbaseTx.TxnHash, coinbaseTx)
+	if Txnerr != nil {
+		return &DBman{}, fmt.Errorf("error Storing Transaction %w", Txnerr)
+	}
+	for _, txn := range block.Transactions {
+		for _, output := range txn.Outputs {
+			db.StoreUTXO(output.Id, output)
+		}
+	}
+	PrevhashErr := db.SetPrevioushash(block.Hash)
+	if PrevhashErr != nil {
+		return &DBman{}, fmt.Errorf("error Storing Prevhash %w", PrevhashErr)
+	}
+	return db, nil
+}
+
 func (tx *Transaction) CalculateHash() string {
 
 	data := tx.BlockHash + tx.TxnHash + string(tx.Sender) + string(tx.Receiver) + tx.Signature
@@ -205,23 +392,7 @@ func (tx *Transaction) CalculateHash() string {
 	// Return the hash as a hexadecimal string
 	return hex.EncodeToString(hash[:])
 }
-func (dm *DBman) AddToMempool(hash string, txn Transaction) error {
-	dm.rwMu.Lock()
-	defer dm.rwMu.Unlock()
 
-	return dm.db.Update(func(tx *bbolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte("MemPoolTransactions"))
-		if err != nil {
-			return fmt.Errorf("create bucket: %w", err)
-		}
-		serialized, err := json.Marshal(txn)
-		if err != nil {
-			return fmt.Errorf("serialize transaction: %w", err)
-		}
-		key := []byte(hash)
-		return bucket.Put(key, serialized)
-	})
-}
 func (dm *DBman) DeleteMempoolTransaction(hash string) (bool, error) {
 	var deleted bool
 	err := dm.db.Update(func(tx *bbolt.Tx) error {
@@ -276,73 +447,147 @@ func (dm *DBman) IsInMempool(hash string) (bool, error) {
 	return exists, nil
 }
 
-// VerifyTransaction verifies the validity of a transaction.
-func (dm *DBman) VerifyTransaction(transaction Transaction) (bool, error) {
-
-	log.Printf("VerifyTransaction: Verifying transaction %s", transaction.TxnHash)
-	var SuccessfullyAdded bool
+func (dm *DBman) VerifyTransaction(ctx context.Context, transaction Transaction) (bool, error) {
+	log.Printf("VerifyTransaction: Starting verification for transaction %s", transaction.TxnHash)
+	var successfullyAdded bool
 
 	err := dm.db.View(func(tx *bbolt.Tx) error {
-		log.Println("VerifyTransaction: Starting bbolt transaction for UTXO check")
-		bucketName := []byte("UTXO")
-		bucket := tx.Bucket(bucketName)
+		select {
+		case <-ctx.Done():
+			log.Println("VerifyTransaction: Context canceled")
+			return ctx.Err()
+		default:
+			log.Println("VerifyTransaction: Starting bbolt transaction for UTXO check")
+			bucketName := []byte("UTXO")
+			bucket := tx.Bucket(bucketName)
+			if bucket == nil {
+				log.Println("VerifyTransaction: UTXO bucket does not exist")
+				return fmt.Errorf("UTXO bucket not initialized")
+			}
+
+			var total float64
+			for _, utxo := range transaction.Inputs {
+				select {
+				case <-ctx.Done():
+					log.Println("VerifyTransaction: Context canceled during UTXO check")
+					return ctx.Err()
+				default:
+					data := bucket.Get([]byte(utxo.Id))
+					if data == nil {
+						log.Printf("VerifyTransaction: Invalid input found for UTXO %s", utxo.Id)
+						return fmt.Errorf("invalid Inputs Input-Id: %s", string(utxo.Id))
+					}
+					total += utxo.Output.Value
+				}
+			}
+
+			log.Printf("VerifyTransaction: Total UTXO value: %f, Transaction amount: %f", total, transaction.Amount)
+			if total < transaction.Amount {
+				log.Printf("VerifyTransaction: Insufficient balance for transaction %s", transaction.TxnHash)
+				return fmt.Errorf("insufficient balance, transaction rejected")
+			}
+
+			select {
+			case <-ctx.Done():
+				log.Println("VerifyTransaction: Context canceled before mempool check")
+				return ctx.Err()
+			default:
+				log.Println("VerifyTransaction: Checking if transaction is in mempool")
+				exist, err := dm.IsInMempool(transaction.TxnHash)
+				if err != nil {
+					log.Printf("VerifyTransaction: Error checking mempool for transaction %s - %v", transaction.TxnHash, err)
+					return fmt.Errorf("error occurred during mempool check: %w", err)
+				}
+
+				if !exist {
+					log.Printf("VerifyTransaction: Adding transaction %s to mempool", transaction.TxnHash)
+					err := dm.AddToMempool(transaction.TxnHash, transaction)
+					if err != nil {
+						log.Printf("VerifyTransaction: Error adding transaction %s to mempool - %v", transaction.TxnHash, err)
+						return fmt.Errorf("error adding transaction to mempool: %w", err)
+					}
+					log.Printf("VerifyTransaction: Transaction %s successfully added to mempool", transaction.TxnHash)
+					successfullyAdded = true
+				} else {
+					log.Printf("VerifyTransaction: Transaction %s already exists in the mempool", transaction.TxnHash)
+					successfullyAdded = false
+				}
+			}
+
+			return nil
+		}
+	})
+
+	if err != nil {
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			log.Printf("VerifyTransaction: Context canceled or deadline exceeded for transaction %s", transaction.TxnHash)
+			return false, err
+		}
+		log.Printf("VerifyTransaction: Error occurred during transaction verification - %v", err)
+		return false, fmt.Errorf("transaction verification failed: %w", err)
+	}
+
+	log.Printf("VerifyTransaction: Transaction %s verified successfully", transaction.TxnHash)
+	return successfullyAdded, nil
+}
+func (dm *DBman) AddToMempool(hash string, txn Transaction) error {
+	dm.rwMu.Lock()
+	defer dm.rwMu.Unlock()
+
+	valid, err := dm.AreInputsValid(txn.Inputs)
+	if err != nil {
+		return fmt.Errorf("validating inputs: %w", err)
+	}
+	if !valid {
+		return fmt.Errorf("transaction rejected due to invalid inputs")
+	}
+
+	return dm.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte("MemPoolTransactions"))
 		if bucket == nil {
-			log.Println("VerifyTransaction: UTXO bucket does not exist")
-			return fmt.Errorf("UTXO bucket not initialized")
+			return fmt.Errorf("bucket MemPoolTransactions does not exist")
 		}
-
-		var total float64
-		for _, utxo := range transaction.Inputs {
-			data := bucket.Get([]byte(utxo.Id))
-			if data == nil {
-				log.Printf("VerifyTransaction: Invalid input found for UTXO %s", utxo.Id)
-				SuccessfullyAdded = false
-				return fmt.Errorf("invalid Inputs Input-Id: %s", string(utxo.Id))
-			}
-			total += utxo.Output.Value
-		}
-
-		log.Printf("VerifyTransaction: Total UTXO value: %f, Transaction amount: %f", total, transaction.Amount)
-		if total < transaction.Amount {
-			log.Printf("VerifyTransaction: Insufficient balance for transaction %s", transaction.TxnHash)
-			SuccessfullyAdded = false
-			return fmt.Errorf("insufficient balance, transaction rejected")
-		}
-
-		exist, err := dm.IsInMempool(transaction.TxnHash)
+		serialized, err := json.Marshal(txn)
 		if err != nil {
-			log.Printf("VerifyTransaction: Error checking mempool for transaction %s - %v", transaction.TxnHash, err)
-			return fmt.Errorf("error occurred during mempool check")
+			return fmt.Errorf("serialize transaction: %w", err)
+		}
+		key := []byte(hash)
+		return bucket.Put(key, serialized)
+	})
+}
+
+// * I know it could be done by utxo function i dont wanna edit the older function and make it incompatible for other related function
+
+func (dm *DBman) AreInputsValid(inputs []Utxo) (bool, error) {
+	var invalidInputs []string
+
+	err := dm.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte("UTXO"))
+		if bucket == nil {
+			return fmt.Errorf("UTXO bucket does not exist; this indicates a serious database initialization problem")
 		}
 
-		if !exist {
-			log.Printf("VerifyTransaction: Adding transaction %s to mempool", transaction.TxnHash)
-			err := dm.AddToMempool(transaction.TxnHash, transaction)
-			if err != nil {
-				log.Printf("VerifyTransaction: Error adding transaction %s to mempool - %v", transaction.TxnHash, err)
-				SuccessfullyAdded = false
-				return fmt.Errorf("error adding transaction to mempool %v", err)
+		for _, utxo := range inputs {
+			if data := bucket.Get([]byte(utxo.Id)); data == nil {
+				invalidInputs = append(invalidInputs, utxo.Id)
 			}
-			log.Printf("VerifyTransaction: Transaction %s successfully added to mempool", transaction.TxnHash)
-			SuccessfullyAdded = true
-		} else {
-			log.Printf("VerifyTransaction: Transaction %s already exists in the mempool", transaction.TxnHash)
 		}
 
 		return nil
 	})
 
 	if err != nil {
-		log.Printf("VerifyTransaction: Error occurred during transaction verification - %v", err)
-		return SuccessfullyAdded, err
+		return false, fmt.Errorf("database error while validating inputs: %w", err)
 	}
 
-	log.Printf("VerifyTransaction: Transaction %s verified successfully", transaction.TxnHash)
-	return SuccessfullyAdded, nil
+	if len(invalidInputs) > 0 {
+		return false, fmt.Errorf("invalid inputs found: %s", strings.Join(invalidInputs, ", "))
+	}
+
+	return true, nil
 }
 func (dm *DBman) GetMempoolTxns() ([]Transaction, error) {
-	dm.rwMu.Lock()
-	defer dm.rwMu.Unlock()
+
 	fmt.Println("GetMempoolTxns: Starting function")
 	var transactions []Transaction
 
@@ -354,17 +599,8 @@ func (dm *DBman) GetMempoolTxns() ([]Transaction, error) {
 		}
 
 		cursor := bucket.Cursor()
-		iterationCount := 0
-		maxIterations := 1000
 
 		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			iterationCount++
-			if iterationCount > maxIterations {
-				fmt.Printf("GetMempoolTxns: Exceeded maximum iterations (%d)\n", maxIterations)
-				return fmt.Errorf("possible infinite loop detected")
-			}
-
-			fmt.Printf("GetMempoolTxns: Processing transaction %d, key: %s\n", iterationCount, string(k))
 
 			var txn Transaction
 			err := json.Unmarshal(v, &txn)
@@ -377,7 +613,7 @@ func (dm *DBman) GetMempoolTxns() ([]Transaction, error) {
 			fmt.Printf("GetMempoolTxns: Transaction added, total count: %d\n", len(transactions))
 		}
 
-		// fmt.Printf("GetMempoolTxns: Finished processing. Total transactions: %d\n", len(transactions))
+		//fmt.Printf("GetMempoolTxns: Finished processing. Total transactions: %v\n", transactions)
 		return nil
 	})
 
@@ -386,7 +622,7 @@ func (dm *DBman) GetMempoolTxns() ([]Transaction, error) {
 		return nil, err
 	}
 
-	// fmt.Printf("GetMempoolTxns: Returning %d transactions\n", len(transactions))
+	//fmt.Printf("GetMempoolTxns: Finished processing. Total transactions: %v\n", transactions)
 	return transactions, nil
 }
 
@@ -395,6 +631,7 @@ func (dm *DBman) SetPrevioushash(hash string) error {
 	dm.rwMu.Lock()
 	defer dm.rwMu.Unlock()
 	err := dm.db.Update(func(tx *bbolt.Tx) error {
+		fmt.Printf("Setting BlockHash %s\n", hash)
 		bucket, err := tx.CreateBucketIfNotExists([]byte("prev_hash"))
 		if err != nil {
 			return fmt.Errorf("failed to create or open bucket: %w", err)
@@ -455,7 +692,7 @@ func (dm *DBman) LogAllTheBlocks() error {
 			}
 
 			// Pretty print the block information
-			fmt.Printf("\n==================== Block %d ====================\n", index)
+			fmt.Printf("\n==================== Block %d ====================\n", block.Height)
 			fmt.Printf("Hash:            %s\n", block.Hash)
 			fmt.Printf("Difficulty:      %v\n", block.Header.Bits)
 			fmt.Printf("Nonce:           %v\n", block.Header.Nonce)
@@ -468,7 +705,8 @@ func (dm *DBman) LogAllTheBlocks() error {
 			for _, txn := range block.Transactions {
 				fmt.Printf("  Txn Hash:      %v\n", txn.TxnHash)
 				fmt.Printf("  Block Hash:    %v\n", txn.BlockHash)
-				fmt.Printf("  Is Coinbase:   %v\n", txn.IsCoinbase)
+				fmt.Printf("  Reciever:   %s\n", txn.Receiver)
+				fmt.Printf("  Sender:   %s\n", txn.Sender)
 				fmt.Printf("  Miner Subsidy: %v\n", txn.Subsidy)
 				if txn.IsCoinbase {
 					fmt.Print("No Inputs Since its a CoinBase Txn\n")
@@ -497,37 +735,57 @@ func (dm *DBman) LogAllTheBlocks() error {
 	})
 	return err
 }
+func (dm *DBman) IsBlockAlreadyPresent(hash string) (bool, error) {
+	var exists bool
+	err := dm.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte("Blocks"))
+		if bucket == nil {
+			return fmt.Errorf("bucket 'Blocks' does not exist")
+		}
+		exists = bucket.Get([]byte(hash)) != nil
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("error checking block presence: %w", err)
+	}
+	return exists, nil
+}
+func (dm *DBman) StoreBlock(block Block) error {
+	exists, err := dm.IsBlockAlreadyPresent(block.Hash)
+	if err != nil {
+		return fmt.Errorf("failed to check if block exists: %w", err)
+	}
+	if exists {
+		return nil
+	}
 
-func (dm *DBman) StoreBlock(block Block, hash string) error {
 	var buffer bytes.Buffer
 	encoder := gob.NewEncoder(&buffer)
-
 	if err := encoder.Encode(block); err != nil {
 		return fmt.Errorf("failed to encode block: %w", err)
 	}
-
-	err := dm.db.Update(func(tx *bbolt.Tx) error {
+	err = dm.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte("Blocks"))
 		if err != nil {
 			return fmt.Errorf("failed to create or open bucket: %w", err)
 		}
 
-		key := []byte(hash)
+		key := []byte(block.Hash)
 		if err := bucket.Put(key, buffer.Bytes()); err != nil {
 			return fmt.Errorf("failed to store block: %w", err)
 		}
+
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	err = dm.SetBlockHeight()
-	if err != nil {
-		return fmt.Errorf(err.Error())
-	}
-	// Set the previous hash
-	if err := dm.SetPrevioushash(hash); err != nil {
-		return fmt.Errorf("failed to set previous hash: %w", err)
+
+	for _, txn := range block.Transactions {
+		_, err := dm.DeleteMempoolTransaction(txn.TxnHash)
+		if err != nil {
+			fmt.Println(err)
+		}
 	}
 
 	return nil
@@ -639,26 +897,53 @@ func (dm *DBman) GetBlocksFromGivenHashTillLatest(hash string) ([]byte, error, b
 	}
 	return buff.Bytes(), nil, false
 }
-func (dm *DBman) StoreTransactions(hash string, txn Transaction) error {
 
+func (dm *DBman) IsTransactionAlreadyPresent(hash string) bool {
+	var exists bool
+	err := dm.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte("Transactions"))
+		if bucket == nil {
+			return fmt.Errorf("bucket Trasactions does not exist Problem with InitDb Function")
+		}
+		if data := bucket.Get([]byte(hash)); data != nil {
+			exists = true
+			return nil
+		}
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("Ignoring Transaction its already present Txn hash %s\n", hash)
+	}
+	return exists
+}
+
+func (dm *DBman) StoreTransaction(hash string, txn Transaction) error {
 	dm.rwMu.Lock()
 	defer dm.rwMu.Unlock()
-	return dm.db.Update(func(tx *bbolt.Tx) error {
+	err := dm.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte("Transactions"))
 		if err != nil {
 			return fmt.Errorf("create bucket: %w", err)
 		}
+		//* we dont have to do this beacuse if accidantly we do end up sending duplicate utxo itll get over written due to same hash but better to be safe than sorry
+		if !dm.IsTransactionAlreadyPresent(hash) {
+			var buff bytes.Buffer
 
-		var buff bytes.Buffer
+			encoder := gob.NewEncoder(&buff)
+			if err = encoder.Encode(txn); err != nil {
 
-		encoder := gob.NewEncoder(&buff)
-		if err = encoder.Encode(txn); err != nil {
-			return fmt.Errorf("serialize transaction: %w", err)
+				return fmt.Errorf("serialize transaction: %w", err)
+			}
+			key := []byte(hash)
+			return bucket.Put(key, buff.Bytes())
 		}
-
-		key := []byte(hash)
-		return bucket.Put(key, buff.Bytes())
+		return nil
 	})
+	if err != nil {
+		return fmt.Errorf("error occured trying to store Transaction Hash %s", hash)
+	}
+	return nil
 }
 func (dm *DBman) TransactionLogger() error {
 	err := dm.db.View(func(tx *bbolt.Tx) error {
@@ -726,6 +1011,8 @@ func (dm *DBman) GetTxnFromMempool(hash string) (Transaction, error) {
 	return Transact, nil
 }
 func (dm *DBman) HasTxnAlreadyBeenMined(hash string) (bool, error) {
+	dm.rwMu.Lock()
+	defer dm.rwMu.Unlock()
 	var exists bool
 	err := dm.db.View(func(tx *bbolt.Tx) error {
 		bucketName := []byte("Transactions")
@@ -746,6 +1033,67 @@ func (dm *DBman) HasTxnAlreadyBeenMined(hash string) (bool, error) {
 	}
 	return exists, nil
 }
+
+// Todo a function to create all the buckets on start so we dont run into dumb issues
+func (dm *DBman) StoreBlocks(senderAddr net.Addr, blocks *[]Block) (bool, error) {
+
+	dm.rwMu.Lock()
+	defer dm.rwMu.Unlock()
+
+	err := dm.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte("Blocks"))
+		if bucket == nil {
+			return fmt.Errorf("bucket 'Blocks' does not exist")
+		}
+
+		for i, block := range *blocks {
+			var buff bytes.Buffer
+			err := gob.NewEncoder(&buff).Encode(block)
+			if err != nil {
+				return fmt.Errorf("error encoding block %d: %v", i, err)
+			}
+
+			err = bucket.Put([]byte(block.Hash), buff.Bytes())
+			if err != nil {
+				return fmt.Errorf("error putting block %d into bucket: %v", i, err)
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		fmt.Println("Error storing blocks, attempting to store in temp bucket:", err)
+		// Store in temp bucket for later retry
+		err = dm.db.Update(func(tx *bbolt.Tx) error {
+			bucket, err := tx.CreateBucketIfNotExists([]byte("tempBlocksStorage"))
+			if err != nil {
+				return fmt.Errorf("error creating temp bucket: %v", err)
+			}
+			//! check if the error was on our side if so store the blocks in a
+			//!temp bucket and after error checks retry also ask who has the
+			//!longest block given all the peers we know of rn if the error was
+			//! inside block / something was wrong init clear temp bucket can move on with our lives
+			// Use a unique key for storing the block set
+			var buff bytes.Buffer
+			if err = gob.NewEncoder(&buff).Encode(blocks); err != nil {
+				return fmt.Errorf("error encoding RecoveryBlocks: %v", err)
+			}
+			err = bucket.Put([]byte("temp"), buff.Bytes())
+			if err != nil {
+				return fmt.Errorf("error storing recovery blocks: %v", err)
+			}
+
+			return nil
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to store recovery blocks: %v", err)
+		}
+		return false, nil
+	}
+
+	return true, nil
+}
+
 func (dm *DBman) GetTransactions(hash string) (interface{}, error) {
 	dm.rwMu.RLock()
 	defer dm.rwMu.RUnlock()
@@ -801,55 +1149,30 @@ func (dm *DBman) StoreUTXO(hash string, utxo Utxo) error {
 		return bucket.Put([]byte(hash), serialized)
 	})
 }
-func (dm *DBman) SetBlockHeight() error {
-	return dm.db.Update(func(tx *bbolt.Tx) error {
-		bucketName := []byte("BlockHeight")
-		bucket, err := tx.CreateBucketIfNotExists(bucketName)
-		if err != nil {
-			return fmt.Errorf("error creating %s bucket: %v", string(bucketName), err)
-		}
-
-		key := []byte("latestBlockHeight")
-		value := bucket.Get(key)
-
-		var currHeight int
-		if value == nil {
-			// Initialize height to 1
-			currHeight = 1
-			fmt.Println("Initializing block height to 1")
-		} else {
-			prevHeight := btoi(value)
-			currHeight = prevHeight + 1
-			fmt.Printf("Incrementing block height from %d to %d\n", prevHeight, currHeight)
-		}
-
-		err = bucket.Put(key, itob(currHeight))
-		if err != nil {
-			return fmt.Errorf("error putting new height: %v", err)
-		}
-
-		fmt.Printf("New block height set to %d\n", currHeight)
-		return nil
-	})
-}
 
 func (dm *DBman) GetBlockHeight() (int, error) {
 	var height int
 	err := dm.db.View(func(tx *bbolt.Tx) error {
-		bucketName := []byte("BlockHeight")
-		bucket := tx.Bucket(bucketName)
+
+		bucket := tx.Bucket([]byte("Blocks"))
 		if bucket == nil {
-			fmt.Println("blockHeight bucket does not exist yet")
-			return fmt.Errorf("blockHeight bucket does not exist yet")
+			return fmt.Errorf("bucket Blocks Does not exist")
 		}
-		key := []byte("latestBlockHeight")
-		data := bucket.Get(key)
-		if data == nil {
-			fmt.Println("height is yet to be set")
-			return fmt.Errorf("height is yet to be set")
+		hash, err := dm.GetPrevHash()
+		if err != nil {
+			fmt.Printf("error occred trying to be get Previous hash")
 		}
-		height = btoi(data)
-		fmt.Printf("Retrieved block height: %d\n", height)
+		sBlock := bucket.Get([]byte(hash))
+		if sBlock != nil {
+			var block Block
+			var buff bytes.Buffer
+			buff.Write(sBlock)
+			err := gob.NewDecoder(&buff).Decode(&block)
+			if err != nil {
+				fmt.Printf("error decoding extracted block\n")
+			}
+			height = block.Height
+		}
 		return nil
 	})
 	if err != nil {
@@ -999,7 +1322,7 @@ func (dm *DBman) ListAllUTXOs() error {
 				return fmt.Errorf("failed to deserialize UTXO: %v", err)
 			}
 			fmt.Printf("Key: %x\n", k)
-			fmt.Printf("  ScriptPubKey: %x\n", utxo)
+			fmt.Printf("ScriptPubKey: %v", utxo)
 
 		}
 		return nil

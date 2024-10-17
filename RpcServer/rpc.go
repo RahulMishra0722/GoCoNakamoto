@@ -3,6 +3,8 @@ package RpcServer
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 
 	"github.com/RahulMishra0722/GC/DBMan"
@@ -12,15 +14,17 @@ import (
 type RpcServer struct {
 	Connman *Server.Server
 	DBman   *DBMan.DBman
+	Mempool map[string]DBMan.Transaction
 }
 type GetBalance struct {
 	PrivateKey string `json:"PrivateKey"`
 }
 
-func NewRpcServer(server *Server.Server, DB *DBMan.DBman) *RpcServer {
+func NewRpcServer(server *Server.Server, DB *DBMan.DBman, mempool map[string]DBMan.Transaction) *RpcServer {
 	return &RpcServer{
 		Connman: server,
 		DBman:   DB,
+		Mempool: mempool,
 	}
 }
 func (rpc *RpcServer) GetBalanceHandler(w http.ResponseWriter, r *http.Request) {
@@ -70,16 +74,41 @@ type TransactionRequest struct {
 }
 
 func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
-	// Handle preflight request
+	log.Println("SendTransaction: Starting")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var reqOuter TransactionRequest
+
+	// log.Println("SendTransaction: Decoding request body")
+	err := json.NewDecoder(r.Body).Decode(&reqOuter)
+	if err != nil {
+		log.Printf("SendTransaction: Error decoding request body: %v", err)
+		http.Error(w, "Error parsing request data", http.StatusBadRequest)
+		return
+	}
+
+	req := reqOuter.Transaction
+	// log.Printf("SendTransaction: Received transaction: %+v", req)
+
+	rpc.Connman.DBMan.AddToMempool(req.TxnHash, req)
+	response := map[string]interface{}{
+		"Response": "We Have Recived Your Transaction wait till The Node will verifies your transaction",
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+func (rpc *RpcServer) SubmitBlock(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.WriteHeader(http.StatusOK)
-		return // Respond with 200 OK for preflight request
+		return
 	}
 
-	// Set CORS headers for actual requests
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -88,39 +117,52 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-
-	var reqOuter TransactionRequest
-	// bodyBytes, _ := ioutil.ReadAll(r.Body)
-	// fmt.Printf("Request body: %s\n", bodyBytes)
-	// r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	err := json.NewDecoder(r.Body).Decode(&reqOuter)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "Error Parsing Req data", http.StatusBadRequest)
+		http.Error(w, "error reading request body", http.StatusBadRequest)
+	}
+	var reqBlock DBMan.Block
+
+	if err := json.Unmarshal(body, &reqBlock); err != nil {
+		http.Error(w, "error unmarshaling json", http.StatusBadRequest)
+	}
+	ok, err := rpc.Connman.ProcessAndStoreNewMinedBlock(reqBlock)
+	if err != nil {
+		fmt.Print(err)
+		http.Error(w, "Error storing block %w", http.StatusInternalServerError)
+	}
+
+	if ok {
+		fmt.Print("STORED YOHOO")
+	}
+	// m.DBman.StoreUTXO(outputSenderUtxo.Id, outputSenderUtxo)
+}
+func (rpc *RpcServer) GetBlockTemplate(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	req := reqOuter.Transaction
-
-	err, stored := rpc.Connman.StoreInMempoolAndRelay(req)
-	if !stored {
-		response := map[string]interface{}{
-			"Response": fmt.Sprintf("Errror adding Transaction to the meempool Node Responded with Error: %v", err),
-		}
-		json.NewEncoder(w).Encode(response)
-	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	template, err := rpc.Connman.BlockTemplate()
 
 	if err != nil {
-		http.Error(w, "Error Adding Transaction to mempool", http.StatusInternalServerError)
-		return
+		//Todo
+		//* 1) init func to create all the buckets and one to shove a genesis block so we never run into getting error on get PrevHash
+		//* 20 change the code so its now compatible with http as in new format
+		json.NewEncoder(w).Encode("Error occured Trying to generate block template")
 	}
-	fmt.Printf("Processed transaction: %+v\n", req)
 
-	w.WriteHeader(http.StatusOK)
-	response := map[string]interface{}{
-		"Response": "Your transaction has been received. Please wait while we process it.",
+	errrr := json.NewEncoder(w).Encode(template)
+
+	if errrr != nil {
+		log.Printf("Error encoding block template: %v", err)
 	}
-	json.NewEncoder(w).Encode(response)
 }
 
 // for transactions to be propogated through correctly without making the code ugly / re intailzing server to avoid we'd have to do this

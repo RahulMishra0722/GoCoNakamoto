@@ -3,6 +3,7 @@ package Server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
@@ -42,37 +43,37 @@ const (
 	HEADERS     CMD = 0x13 // headers
 )
 
-// // CommandToString maps command identifiers to their string representations
-// var CommandToString = map[CMD]string{
-// 	VERSION:     "version",
-// 	VERACK:      "verack",
-// 	GETBLOCKS:   "getblocks",
-// 	INV:         "inv",
-// 	GETDATA:     "getdata",
-// 	BLOCK:       "block",
-// 	TX:          "tx",
-// 	PING:        "ping",
-// 	PONG:        "pong",
-// 	REJECT:      "reject",
-// 	ADDR:        "addr",
-// 	GETADDR:     "getaddr",
-// 	MEMPOOL:     "mempool",
-// 	ALERT:       "alert",
-// 	FEEFILTER:   "feefilter",
-// 	SENDHEADERS: "sendheaders",
-// 	SENDCMPCT:   "sendcmpct",
-// 	GETHEADERS:  "getheaders",
-// 	HEADERS:     "headers",
-// }
-
 const (
 	VERSION_BYTE = 1
 	CMD_BYTE     = 1
 	LENGTH_BYTES = 2
 	version      = 0.1
+	Difficulty   = 0x1e00ffff
 )
 
-// Server represents the server that listens for incoming connections
+//! 0x1e00ffff
+/*
+ Let's break it down:
+
+ The difficulty is represented in compact form as 0x1e00ffff.
+ This compact format splits into two parts:
+ 1. The **exponent**: 0x1e, which is 30 in decimal.
+ 2. The **coefficient**: 0x00ffff, which is 65535 in decimal.
+
+ To calculate the target value for mining, we need to convert this compact representation.
+ We shift the coefficient left by 8 * (exponent - 3) bits.
+
+ In this case:
+ Exponent = 30
+ Left shift by 8 * (30 - 3) = 8 * 27 = 216 bits
+
+ This means the coefficient (65535) is multiplied by 2^216.
+
+ The result is a large target value, making it easier to find a valid hash and since our mining function finds hashes target lower difficulty target
+ having a bigger number will increase our chances of getting a valid block hash
+ In other words, this is a **low difficulty**, meaning mining will be relatively **easy**.
+*/
+
 type Server struct {
 	DBMan        *DBMan.DBman
 	host         string
@@ -99,6 +100,7 @@ const (
 	ErrorDatabase
 	ErrorProtocol
 	ErrorInternal
+	ErrorNeedsRetry
 )
 
 type ServerError struct {
@@ -356,6 +358,34 @@ func (cn *CNode) SendVersionMessage() error {
 	}
 	return nil
 }
+func (s *Server) BlockTemplate() (DBMan.BlockTemplate, error) {
+
+	prevHash, err := s.DBMan.GetPrevHash()
+	if err != nil {
+		fmt.Print(err)
+	}
+	height, GetBlockHeightError := s.DBMan.GetBlockHeight()
+	fmt.Printf("Height %d", height)
+	if GetBlockHeightError != nil {
+		fmt.Print(GetBlockHeightError)
+	}
+	transactions, err := s.DBMan.GetMempoolTxns()
+	fmt.Println(transactions)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	template := DBMan.BlockTemplate{
+		Version:       version,
+		Height:        height + 1,
+		Transactions:  transactions,
+		PrevBlockHash: prevHash,
+		MerkleRoot:    "",
+		Bits:          Difficulty,
+		Timestamp:     time.Now().Unix(),
+	}
+	return template, nil
+}
 func (cn *CNode) OnGetDataReqTX(hash string) error {
 	fmt.Printf("INCOMMING-HASH:%s\n", (hash))
 	txn, err := cn.server.DBMan.GetTxnFromMempool(hash)
@@ -401,6 +431,16 @@ func (s *Server) handleError(err error) {
 		log.Printf("Protocol Error : %v", serverErr)
 	case ErrorInternal:
 		log.Printf("Internal Error : %v", serverErr)
+	case ErrorNeedsRetry:
+		//verifyBlock with peers
+		//only send to peers who are all caught up // have the maxumu number if blocks
+
+		//!Steps
+		// go to db get the temp blocks
+		// ask them  their block height
+		// whoever has it exculding the node which send these blocks
+		// well we should store thier block height so make em send thier block height
+
 	}
 }
 func (cn *CNode) handler() {
@@ -474,17 +514,76 @@ func (cn *CNode) handler() {
 			go cn.OnGetDataReqTX(string(msg.Data))
 		} else if msg.Cammand == byte(TX) {
 
-			var txn DBMan.Transaction
-			decodedTxn, err := cn.Utils.Decode(msg.Data, &txn)
-			if err != nil {
-				cn.server.handleError(NewServerError(ErrorProtocol, "error decoding message from peer", err))
-			}
-			cn.server.StoreInMempoolAndRelay(decodedTxn)
+			// var txn DBMan.Transaction
+			// decodedTxn, err := cn.Utils.Decode(msg.Data, &txn)
+			// if err != nil {
+			// 	cn.server.handleError(NewServerError(ErrorProtocol, "error decoding message from peer", err))
+			// }
+			//	cn.server.StoreInMempoolAndRelay(decodedTxn)
+		} else if msg.Cammand == byte(BLOCK) {
+			// i think we call the peers rn to verify these blocks
+			// Call the function with remote addr and blocks
+
 		}
 
 	}
 }
 
+func (s *Server) ProcessAndStoreNewMinedBlock(block DBMan.Block) (bool, error) {
+	for _, txn := range block.Transactions {
+		//Todo check if any of the utxo is absent if so reject
+		for _, inputs := range txn.Inputs {
+			exist, err := s.DBMan.UTXOExists(inputs.Id)
+			if !exist {
+				fmt.Println(err)
+				return false, fmt.Errorf("rejecting Block Txn With Invalid Utxo Inputs error occured ON UTXO %s", inputs.Id)
+			}
+		}
+	}
+	for _, txn := range block.Transactions {
+		//Todo check if any of the utxo is absent if so reject
+		for _, inputs := range txn.Inputs {
+			err := s.DBMan.DeleteUtxo(inputs.Id)
+			if err != nil {
+				return false, fmt.Errorf("error deleting Inputs %w", err)
+			}
+		}
+
+		for _, outputSenderUtxo := range txn.Outputs {
+			s.DBMan.StoreUTXO(outputSenderUtxo.Id, outputSenderUtxo)
+		}
+		err := s.DBMan.StoreTransaction(txn.TxnHash, txn)
+		if err != nil {
+			return false, fmt.Errorf("error Storing txns %w", err)
+		}
+	}
+	err := s.DBMan.StoreBlock(block)
+	if err != nil {
+		return false, fmt.Errorf("error storing block with hash %s %w", block.Hash, err)
+	}
+	s.DBMan.SetPrevioushash(block.Hash)
+	s.BroadCasteBlock()
+	return true, nil
+
+}
+
+func (s *Server) BroadCasteBlock() error {
+
+	return nil
+}
+
+//	func (cn *CNode) ValidateBlocksWithPeers() {
+//		for _, peer := range cn.server.peers {
+//			peer.
+//		}
+//	}
+//
+//	func (cn *CNode) StoreInCommingBlocks(blocks []DBMan.Block) error {
+//		ok, err := cn.server.DBMan.StoreBlocks(cn.conn.RemoteAddr(), &blocks)
+//		if !ok {
+//			cn.server.handleError(NewServerError(ErrorNeedsRetry, "Error storing blocks that the peer sent", err))
+//		}
+//	}
 func (cn *CNode) RequestTxn(txn []byte) error {
 	getDataRequest := NewMessage()
 	length := dataByteLen(txn)
@@ -506,26 +605,24 @@ func (s *Server) RelayToKnowPeers(transaction DBMan.Transaction) {
 	newRelay.Data = data
 	newRelay.Length = length
 	encoded := encodeMessage(newRelay)
-	for _, peer := range s.peers {
-		peer.VSend <- encoded
+	if len(s.peers) > 0 {
+		for _, peer := range s.peers {
+			peer.VSend <- encoded
+		}
 	}
 
 }
 
 // ! if added call a relay function and send the txn hashes in mempool and they will check in their db do they already have any of the given txn that maches the hashes provided.
 // ! or give them all and let em handle theyll just drop it if they already have it i takes one call so i think its faster ill still go with first this one will end up sending alot of redundant data across and the overhead will be insane
-func (s *Server) StoreInMempoolAndRelay(transaction DBMan.Transaction) (error, bool) {
-
-	added, err := s.DBMan.VerifyTransaction(transaction)
+func (s *Server) StoreInMempoolAndRelay(ctx context.Context, transaction DBMan.Transaction) (error, bool) {
+	log.Println("StoreInMempoolAndRelay: Starting")
+	added, err := s.DBMan.VerifyTransaction(ctx, transaction)
 	if err != nil {
-		return NewServerError(ErrorDatabase, "error verifying transaction", err), false
-	}
-	if !added {
+		log.Printf("StoreInMempoolAndRelay: Error verifying transaction: %v", err)
 		return err, false
 	}
-	if added {
-		s.RelayToKnowPeers(transaction)
-	}
+	log.Printf("StoreInMempoolAndRelay: Transaction verified. Added: %v", added)
 	return nil, added
 }
 func (s *Server) LogPeers() {
@@ -574,7 +671,7 @@ func InItServer() (Server, error) {
 	log.Println("Starting server application")
 	//! Problem we are intialising db too many times in handler its ugly after test fix it
 	//Todo
-	db, err := DBMan.GetDB("../../testDB")
+	db, err := DBMan.InitDB()
 	if err != nil {
 		return Server{}, fmt.Errorf("error occurred initializing db: %w", err)
 	}

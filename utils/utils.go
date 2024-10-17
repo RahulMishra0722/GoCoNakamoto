@@ -29,6 +29,8 @@ func (u *Utils) Encode(data DBMan.Transaction) ([]byte, error) {
 	}
 	return buff.Bytes(), nil
 }
+
+// * just for test
 func (u *Utils) TestEncode(data TestDBMan.Transaction) ([]byte, error) {
 	var buff bytes.Buffer
 	encoder := gob.NewEncoder(&buff)
@@ -48,6 +50,8 @@ func (u *Utils) Decode(data []byte, d interface{}) (DBMan.Transaction, error) {
 	}
 	return txn, nil
 }
+
+// * just for test
 func (u *Utils) TestDecode(data []byte, d interface{}) (TestDBMan.Transaction, error) {
 	var txn TestDBMan.Transaction
 	var buff = bytes.NewBuffer(data)

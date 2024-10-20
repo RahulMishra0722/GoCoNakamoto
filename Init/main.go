@@ -9,6 +9,7 @@ import (
 	"github.com/RahulMishra0722/GC/DBMan"
 	"github.com/RahulMishra0722/GC/RpcServer"
 	"github.com/RahulMishra0722/GC/Server"
+	"github.com/RahulMishra0722/GC/TestServer"
 )
 
 func CORSMiddleware(next http.Handler) http.Handler {
@@ -34,9 +35,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error occurred initializing server: %v", err)
 	}
-	prevHash, err := server.DBMan.GetPrevHash()
+	ts, err := TestServer.InItServer()
+	if err != nil {
+		log.Fatalf("Error occurred initializing server: %v", err)
+	}
+	ts.DBMan.LogAllTheBlocks()
 
-	fmt.Println("Previous Block Hash %s\n  error %w\n", prevHash, err)
 	rpc := RpcServer.NewRpcServer(&server, server.DBMan, make(map[string]DBMan.Transaction))
 
 	router := http.NewServeMux()
@@ -62,6 +66,6 @@ func main() {
 	fmt.Println("Sleeping for 2 seconds before calling")
 	time.Sleep(2 * time.Second)
 	server.Dial("127.0.0.1:8081")
-	rpc.Connman.DBMan.LogAllTheBlocks()
+
 	select {}
 }

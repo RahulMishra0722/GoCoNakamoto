@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"net"
+	"sort"
 	"strings"
 	"sync"
 
@@ -149,31 +149,41 @@ func DeserializeMempool(data []byte) (Transaction, error) {
 func SerializeUtxo(utxo Utxo) ([]byte, error) {
 	return json.Marshal(utxo)
 }
-func GetDB() (*DBman, error) {
-	if instance == nil {
-		dbMutex.Lock()
-		defer dbMutex.Unlock()
+func GetDB(path string) (*DBman, error) {
+	// if instance == nil {
+	// 	dbMutex.Lock()
+	// 	defer dbMutex.Unlock()
 
-		if instance == nil {
-			var err error
-			once.Do(func() {
-				db, openErr := bbolt.Open("../../testDB", 0666, nil)
-				if openErr != nil {
-					err = fmt.Errorf("failed to open database: %w", openErr)
-					return
-				}
-				instance = &DBman{
-					db: db,
-				}
-			})
-			if err != nil {
-				return nil, err
-			}
-		}
+	// 	if instance == nil {
+	// 		var err error
+	// 		once.Do(func() {
+	// 			db, openErr := bbolt.Open(path, 0666, nil)
+	// 			if openErr != nil {
+	// 				err = fmt.Errorf("failed to open database: %w", openErr)
+	// 				return
+	// 			}
+	// 			instance = &DBman{
+	// 				db: db,
+	// 			}
+	// 		})
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	// 	}
+	// }
+
+	// if instance == nil || instance.db == nil {
+	// 	return nil, fmt.Errorf("database is not initialized properly")
+	// }
+
+	// return instance, nil
+	db, openErr := bbolt.Open(path, 0666, nil)
+	if openErr != nil {
+		err := fmt.Errorf("failed to open database: %w", openErr)
+		return &DBman{}, err
 	}
-
-	if instance == nil || instance.db == nil {
-		return nil, fmt.Errorf("database is not initialized properly")
+	instance = &DBman{
+		db: db,
 	}
 
 	return instance, nil
@@ -310,8 +320,8 @@ func CalculateTransactionHash(tx Transaction) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func InitDB() (*DBman, error) {
-	db, err := GetDB()
+func InitDB(path string) (*DBman, error) {
+	db, err := GetDB(path)
 	if err != nil {
 		fmt.Printf("error occured Initialising the DBMan")
 	}
@@ -348,10 +358,7 @@ func InitDB() (*DBman, error) {
 			db.StoreUTXO(output.Id, output)
 		}
 	}
-	PrevhashErr := db.SetPrevioushash(block.Hash)
-	if PrevhashErr != nil {
-		return &DBman{}, fmt.Errorf("error Storing Prevhash %w", PrevhashErr)
-	}
+
 	return db, nil
 }
 
@@ -625,25 +632,38 @@ func (dm *DBman) GetMempoolTxns() ([]Transaction, error) {
 	//fmt.Printf("GetMempoolTxns: Finished processing. Total transactions: %v\n", transactions)
 	return transactions, nil
 }
+func (dm *DBman) GetBlocksForGivenHashes(hashes []string) ([]Block, error) {
+	var requestedBlocks []Block
+	err := dm.db.View(func(tx *bbolt.Tx) error {
+		blocks := tx.Bucket([]byte("Blocks"))
+		if blocks == nil {
+			return fmt.Errorf("bucket %s doesn't exist", "Blocks")
+		}
 
-// setPrevioushash updates the previous hash value in the database.
-func (dm *DBman) SetPrevioushash(hash string) error {
-	dm.rwMu.Lock()
-	defer dm.rwMu.Unlock()
-	err := dm.db.Update(func(tx *bbolt.Tx) error {
-		fmt.Printf("Setting BlockHash %s\n", hash)
-		bucket, err := tx.CreateBucketIfNotExists([]byte("prev_hash"))
-		if err != nil {
-			return fmt.Errorf("failed to create or open bucket: %w", err)
+		for i, hash := range hashes {
+			data := blocks.Get([]byte(hash))
+			if data == nil {
+				continue
+			}
+			fmt.Printf("Hashe no %d Hash %s\n", i, hash)
+			var block Block
+			buff := bytes.NewBuffer(data)
+			err := gob.NewDecoder(buff).Decode(&block)
+			if err != nil {
+				return fmt.Errorf("error decoding block for hash %s: %w", hash, err)
+			}
+
+			requestedBlocks = append(requestedBlocks, block)
 		}
-		key := []byte("Prev")
-		if err := bucket.Put(key, []byte(hash)); err != nil {
-			return fmt.Errorf("failed to set previous hash: %w", err)
-		}
+
 		return nil
 	})
-	return err
+	sort.Slice(requestedBlocks, func(i, j int) bool {
+		return requestedBlocks[i].Height < requestedBlocks[j].Height
+	})
+	return requestedBlocks, err
 }
+
 func (dm *DBman) GetPrevHash() (string, error) {
 	dm.rwMu.Lock()
 	defer dm.rwMu.Unlock()
@@ -774,6 +794,11 @@ func (dm *DBman) StoreBlock(block Block) error {
 		if err := bucket.Put(key, buffer.Bytes()); err != nil {
 			return fmt.Errorf("failed to store block: %w", err)
 		}
+		prevHashBucket := tx.Bucket([]byte("prev_hash"))
+		err = prevHashBucket.Put([]byte("Prev"), []byte(block.Hash))
+		if err != nil {
+			return fmt.Errorf("error setting BlockPrev hash")
+		}
 
 		return nil
 	})
@@ -782,10 +807,14 @@ func (dm *DBman) StoreBlock(block Block) error {
 	}
 
 	for _, txn := range block.Transactions {
-		_, err := dm.DeleteMempoolTransaction(txn.TxnHash)
-		if err != nil {
-			fmt.Println(err)
+		if !txn.IsCoinbase {
+			_, err := dm.DeleteMempoolTransaction(txn.TxnHash)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+
 		}
+
 	}
 
 	return nil
@@ -822,80 +851,46 @@ func (dm *DBman) GetBlock(hash string) (Block, error) {
 	return block, nil
 }
 
-// IsInMempool checks if a transaction with a given hash is in the mempool.
+func (dm *DBman) FromNToLatestHash(hash string) ([]string, error) {
+	var blockHashes []string
 
-func (dm *DBman) GetBlocksFromGivenHashTillLatest(hash string) ([]byte, error, bool) { //*Bool is to indicate if both nodes are at the same level / have the same number of blocks
-	var BlockHashThatTheNodeSent Block
-	var LatestBlock Block
-	var payloadBlocks []Block
-	dm.db.View(func(tx *bbolt.Tx) error {
-
-		bucketName := []byte("Blocks")
-		bucket := tx.Bucket(bucketName)
-		if bucket == nil {
-			return fmt.Errorf("bucket block does not exists this shouldnt be happening to begin with %s", string(bucketName))
+	err := dm.db.View(func(tx *bbolt.Tx) error {
+		blocks := tx.Bucket([]byte("Blocks"))
+		if blocks == nil {
+			return fmt.Errorf("blocks bucket not found")
 		}
-		key := []byte(hash)
-		data := bucket.Get(key)
+
+		data := blocks.Get([]byte(hash))
 		if data == nil {
-			return fmt.Errorf("block for the key %s does not exist", hash)
+			return fmt.Errorf("reference block hash %s not found", hash)
 		}
 
-		buffer := bytes.NewBuffer(data)
-		decoder := gob.NewDecoder(buffer)
-		if err := decoder.Decode(&BlockHashThatTheNodeSent); err != nil {
-			return fmt.Errorf("failed to decode block with hash %s", hash)
-		}
-		prev_hash, err := dm.GetPrevHash()
-
-		if err != nil {
-			return fmt.Errorf("error occured getting previos hash Error%v", err)
+		var referenceBlock Block
+		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&referenceBlock); err != nil {
+			return fmt.Errorf("failed to decode reference block: %w", err)
 		}
 
-		Prevkey := []byte(prev_hash)
-		latestBlockbyte := bucket.Get(Prevkey)
-		if data == nil {
-			return fmt.Errorf("block for the key %s does not exist", hash)
-		}
+		blockHashes = make([]string, 0, 1000)
 
-		latestBuffer := bytes.NewBuffer(latestBlockbyte)
-		Latestdecoder := gob.NewDecoder(latestBuffer)
-		if err := Latestdecoder.Decode(&LatestBlock); err != nil {
-			return fmt.Errorf("failed to decode block with hash %s", hash)
-		}
-
-		cursor := bucket.Cursor()
-		numberOfBlocksNeeded := LatestBlock.Height - BlockHashThatTheNodeSent.Height + 1
-		fmt.Println(numberOfBlocksNeeded)
+		cursor := blocks.Cursor()
 		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			if numberOfBlocksNeeded == 0 {
-				break
-			}
 			var block Block
-			buff := bytes.NewBuffer(v)
-			decoder := gob.NewDecoder(buff)
-			if err := decoder.Decode(&block); err != nil {
-				return fmt.Errorf("error occured decoding block during itteration block hash %s", string(k))
+			if err := gob.NewDecoder(bytes.NewReader(v)).Decode(&block); err != nil {
+				return fmt.Errorf("failed to decode block at cursor position: %w", err)
 			}
-			//	fmt.Printf("height outside of the check %d\n", block.Height)
-			//	fmt.Printf("BlockHashThatTheNodeSent__Height %d\n", BlockHashThatTheNodeSent.Height)
-			if block.Height > BlockHashThatTheNodeSent.Height {
-				fmt.Println(block.Height)
-				payloadBlocks = append(payloadBlocks, block)
+
+			if block.Height > referenceBlock.Height {
+				blockHashes = append(blockHashes, block.Hash)
 			}
-			numberOfBlocksNeeded--
 		}
 		return nil
 	})
-	if len(payloadBlocks) == 0 {
-		return []byte{}, fmt.Errorf("both Nodes have the same know blocks"), true
+
+	if err != nil {
+		return nil, fmt.Errorf("database operation failed: %w", err)
 	}
-	var buff bytes.Buffer
-	encoder := gob.NewEncoder(&buff)
-	if err := encoder.Encode(payloadBlocks); err != nil {
-		return nil, fmt.Errorf("error encoding blocks: %v", err), false
-	}
-	return buff.Bytes(), nil, false
+
+	return blockHashes, err
 }
 
 func (dm *DBman) IsTransactionAlreadyPresent(hash string) bool {
@@ -1035,7 +1030,7 @@ func (dm *DBman) HasTxnAlreadyBeenMined(hash string) (bool, error) {
 }
 
 // Todo a function to create all the buckets on start so we dont run into dumb issues
-func (dm *DBman) StoreBlocks(senderAddr net.Addr, blocks *[]Block) (bool, error) {
+func (dm *DBman) StoreBlocks(blocks *[]Block) (bool, error) {
 
 	dm.rwMu.Lock()
 	defer dm.rwMu.Unlock()
@@ -1056,6 +1051,11 @@ func (dm *DBman) StoreBlocks(senderAddr net.Addr, blocks *[]Block) (bool, error)
 			err = bucket.Put([]byte(block.Hash), buff.Bytes())
 			if err != nil {
 				return fmt.Errorf("error putting block %d into bucket: %v", i, err)
+			}
+			prevHashBucket := tx.Bucket([]byte("prev_hash"))
+			err = prevHashBucket.Put([]byte("Prev"), []byte(block.Hash))
+			if err != nil {
+				return fmt.Errorf("error setting BlockPrev hash")
 			}
 		}
 		return nil
@@ -1271,7 +1271,12 @@ func (dm *DBman) DeleteUtxo(hash string) error {
 	fmt.Printf("\nDELETING UTXO %s\n", hash)
 	return nil
 }
-
+func (dm *DBman) Close() {
+	if dm.db != nil {
+		fmt.Printf("Closing down DBMan")
+		dm.db.Close()
+	}
+}
 func (dm *DBman) GetBalance(pubkey string) (float64, []Utxo, error) {
 
 	dm.rwMu.Lock()

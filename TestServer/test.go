@@ -3,18 +3,21 @@ package TestServer
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"math/rand"
 	"net"
 	"strings"
 	"time"
 
 	"github.com/RahulMishra0722/GC/DBMan"
-	"github.com/RahulMishra0722/GC/TestDBMan"
 	"github.com/RahulMishra0722/GC/Utils"
 )
 
@@ -22,60 +25,114 @@ type CMD uint8
 
 // make the node send its lastBlockHash nvm i was gonna say with height but thats like one sec look in db
 const (
-	VERSION     CMD = 0x01 // version
-	VERACK      CMD = 0x02 // version acknowledgement
-	GETBLOCKS   CMD = 0x03 // request blocks
-	INV         CMD = 0x04 // inventory
-	GETDATA     CMD = 0x05 // request data
-	BLOCK       CMD = 0x06 // block
-	TX          CMD = 0x07 // transaction
-	PING        CMD = 0x08 // ping
-	PONG        CMD = 0x09 // pong
-	REJECT      CMD = 0x0A // reject
-	ADDR        CMD = 0x0B // addresses
-	GETADDR     CMD = 0x0C // get addresses
-	MEMPOOL     CMD = 0x0D // mempool request
-	ALERT       CMD = 0x0E // alert
-	FEEFILTER   CMD = 0x0F // fee filter
-	SENDHEADERS CMD = 0x10 // send headers
-	SENDCMPCT   CMD = 0x11 // send compact
-	GETHEADERS  CMD = 0x12 // get headers
-	HEADERS     CMD = 0x13 // headers
+	VERSION   CMD = 0x01 // version
+	VERACK    CMD = 0x02 // version acknowledgement
+	GETBLOCKS CMD = 0x03 // request blocks
+	INV       CMD = 0x04 // inventory
+	GETDATA   CMD = 0x05 // request data
+	BLOCK     CMD = 0x06 // block
+	TX        CMD = 0x07 // transaction
+	PING      CMD = 0x08 // ping
+	PONG      CMD = 0x09 // pong
+	REJECT    CMD = 0x0A // reject
+	ADDR      CMD = 0x0B // addresses
+	GETADDR   CMD = 0x0C // get addresses
+	MEMPOOL   CMD = 0x0D // mempool request
+	//ALERT       CMD = 0x0E // alert
+	//FEEFILTER   CMD = 0x0F // fee filter
+	//SENDHEADERS CMD = 0x10 // send headers
+	//SENDCMPCT   CMD = 0x11 // send compact
+	//GETHEADERS  CMD = 0x12 // get headers
+	HEADERS         CMD = 0x13 // headers
+	BLOCKS          CMD = 0x14
+	REQUESTEDBLOCKS CMD = 0x15
 )
-
-// // CommandToString maps command identifiers to their string representations
-// var CommandToString = map[CMD]string{
-// 	VERSION:     "version",
-// 	VERACK:      "verack",
-// 	GETBLOCKS:   "getblocks",
-// 	INV:         "inv",
-// 	GETDATA:     "getdata",
-// 	BLOCK:       "block",
-// 	TX:          "tx",
-// 	PING:        "ping",
-// 	PONG:        "pong",
-// 	REJECT:      "reject",
-// 	ADDR:        "addr",
-// 	GETADDR:     "getaddr",
-// 	MEMPOOL:     "mempool",
-// 	ALERT:       "alert",
-// 	FEEFILTER:   "feefilter",
-// 	SENDHEADERS: "sendheaders",
-// 	SENDCMPCT:   "sendcmpct",
-// 	GETHEADERS:  "getheaders",
-// 	HEADERS:     "headers",
-// }
 
 const (
 	VERSION_BYTE = 1
 	CMD_BYTE     = 1
 	LENGTH_BYTES = 2
 	version      = 0.1
+	Difficulty   = 0x1e00ffff
+	Red          = "\033[31m"
+	Green        = "\033[32m"
+	DarkGreen    = "\033[38;5;22m"
+	Yellow       = "\033[33m"
+	DarkYellow   = "\033[38;5;3m"
+	Blue         = "\033[34m"
+	DarkBlue     = "\033[38;5;18m"
+	Purple       = "\033[35m"
+	DarkPurple   = "\033[38;5;56m"
+	DarkRed      = "\033[38;5;52m"
+	Reset        = "\033[0m"
 )
 
-// Server represents the server that listens for incoming connections
+//! 0x1e00ffff
+/*
+ Let's break it down:
+ 0001 1110 0000 000 1111 1111 1111 1111
+ The difficulty is represented in compact form as 0x1e00ffff.
+ This compact format splits into two parts:
+ 1. The **exponent**: 0x1e, which is 30 in decimal.
+ 2. The **coefficient**: 0x00ffff, which is 65535 in decimal.
+
+ To calculate the target value for mining, we need to convert this compact representation.
+ We shift the coefficient left by 8 * (exponent - 3) bits.
+
+ In this case:
+ Exponent = 30
+ Left shift by 8 * (30 - 3) = 8 * 27 = 216 bits
+
+ This means the coefficient (65535) is multiplied by 2^216.
+
+ The result is a large target value, making it easier to find a valid hash and since our mining function finds hashes target lower difficulty target
+ having a bigger number will increase our chances of getting a valid block hash
+ In other words, this is a **low difficulty**, meaning mining will be relatively **easy**.
+*/
+func CompactToBig(compact uint32) *big.Int {
+	// !Mental Note
+	// The current difficulty is represented in compact form as 0x1c1fffff.
+	// In binary, this is: 0001 1100 0001 1111 1111 1111 1111 1111
+	// The first 8 bits represent the exponent, and the last 24 bits represent the coefficient.
+
+	// Extract the exponent by right-shifting the compact value by 24 bits.
+	// This gives us the first byte (0x1c) as the exponent.
+	exponent := uint(compact >> 24)
+
+	// Extract the coefficient using a bitwise AND operation with 0x007fffff.
+	// This masks out the upper 8 bits, leaving only the lower 24 bits (the coefficient).
+	coefficient := compact & 0x007fffff // we use this to zero out the exponent and extract coefficient
+	// In binary, 0x007fffff is: 0000 0111 1111 1111 1111 1111 1111
+	// Performing the AND operation results in:
+	// 0001 1100 0001 1111 1111 1111 1111 1111 (compact)
+	// AND
+	// 0000 0000 0111 1111 1111 1111 1111 1111 (mask)
+	// --------------------------------------------
+	// Resulting in:
+	// 0 0 0 0    0 0 0 0   0 0 0 1   1 1 1 1  1 1 1 1   1 1 1 1   1 1 1 1  1 1 1 1
+	//   0          1          1         f        f         f         f        f
+	// This binary value corresponds to the coefficient 0x001fffff or 0x1fffff in hexadecimal.
+
+	// Create a new big.Int and set its value to the coefficient.
+	target := new(big.Int).SetUint64(uint64(coefficient))
+	// This converts the coefficient (e.g., 2097151 for 0x1fffff) into a big integer.
+
+	// Shift the target to the left by (8 * (exponent - 3)) bits.
+	// This is equivalent to multiplying the target by 2 raised to the power of (8 * (exponent - 3)).
+	// The exponent is 28, so we calculate:
+	// 8 * (28 - 3) = 8 * 25 = 200
+	// Thus, we are effectively multiplying the target by 2^200.
+	target.Lsh(target, 8*(exponent-3))
+
+	// The result is a big integer that represents the mining difficulty target.
+	// A higher value for the target indicates a lower difficulty in mining,
+	// while a smaller value (like this one, due to the left shift) indicates a high difficulty.
+
+	return target
+}
+
 type TestServer struct {
-	DBMan        *TestDBMan.TestDBMan
+	DBMan        *DBMan.DBman
 	host         string
 	port         string
 	peers        []*CNode
@@ -100,6 +157,7 @@ const (
 	ErrorDatabase
 	ErrorProtocol
 	ErrorInternal
+	ErrorNeedsRetry
 )
 
 type ServerError struct {
@@ -158,6 +216,7 @@ type CNode struct {
 	LastServed       time.Time
 	Utils            *Utils.Utils
 	server           *TestServer
+	block            bool
 }
 
 func (cn *CNode) Close() {
@@ -177,6 +236,7 @@ func NewCNode(server *TestServer) CNode {
 		LastServed:       time.Time{},
 		Utils:            &Utils.Utils{},
 		server:           server,
+		block:            false,
 	}
 }
 
@@ -188,7 +248,7 @@ func NewCNode(server *TestServer) CNode {
 type Config struct {
 	Host  string
 	Port  string
-	DBMan *TestDBMan.TestDBMan
+	DBMan *DBMan.DBman
 }
 
 // New initializes a new server with the given configuration
@@ -316,7 +376,7 @@ func decodeMessage(reader io.Reader) (Message, error) {
 	fmt.Printf("Decoded Command: %d\n", msg.Cammand)
 	return msg, nil
 }
-func (cn *CNode) SendVerack() error {
+func (cn *CNode) SendVerack(height int) error {
 	log.Printf("Sending Version Acknowledgement to %s", cn.conn.RemoteAddr())
 	Verack := NewMessage()
 	Verack.Cammand = byte(VERACK)
@@ -327,7 +387,39 @@ func (cn *CNode) SendVerack() error {
 		cn.server.handleError(NewServerError(ErrorNetwork, message, err))
 		return fmt.Errorf("error occured sending Verack Message: Err:%v", err)
 	}
+	if err := cn.SendVersionMessage(); err != nil {
+		cn.server.handleError(NewServerError(ErrorNetwork, "Error Sending VersionMessage", err))
+	}
+	curHeight, err := cn.server.DBMan.GetBlockHeight()
+	if err != nil {
+		cn.server.handleError(NewServerError(ErrorDatabase, "Error getting block height from db", err))
+	}
+	fmt.Printf("My HEIGHT Test%d\n", curHeight)
+
+	if curHeight < height {
+		fmt.Printf("My HEIGHT %d\n", curHeight)
+		fmt.Printf("Peer HEIGHT %d\n", height)
+		cn.RequestBlocks()
+	}
+
+	cn.ExchangedVersion = true
+
 	return nil
+}
+func (cn *CNode) RequestBlocks() {
+	message := NewMessage()
+
+	hash, err := cn.server.DBMan.GetPrevHash()
+	if err != nil {
+		cn.server.handleError(NewServerError(ErrorDatabase, "Error trying to get Prev Hash from DBMan", err))
+	}
+	length := dataByteLen([]byte(hash))
+	message.Length = length
+	message.Cammand = byte(GETBLOCKS)
+	message.Data = []byte(hash)
+	encodedRequest := encodeMessage(message)
+	cn.VSend <- encodedRequest
+
 }
 func (cn *CNode) SendVersionMessage() error {
 	log.Printf("Sending Version message to %s", cn.conn.RemoteAddr())
@@ -336,12 +428,16 @@ func (cn *CNode) SendVersionMessage() error {
 	if !cn.ExchangedVersion {
 		var data = NewVersionMessage()
 		var buff bytes.Buffer
-
+		currentBlockHeight, GetHighterr := cn.server.DBMan.GetBlockHeight()
 		endr := gob.NewEncoder(&buff)
 		err := endr.Encode(data)
 		if err != nil {
 			cn.server.handleError(NewServerError(ErrorNetwork, "error encoding Version Message", err))
 		}
+		if GetHighterr != nil {
+			cn.server.handleError(NewServerError(ErrorDatabase, "Error getting Block Height From DBMan", GetHighterr))
+		}
+		data.StartHeight = int32(currentBlockHeight)
 
 		version := NewMessage()
 		version.Cammand = byte(VERSION)
@@ -353,10 +449,54 @@ func (cn *CNode) SendVersionMessage() error {
 			cn.server.handleError(NewServerError(ErrorNetwork, "error Writing Version Message", err))
 			return err
 		}
-		cn.ExchangedVersion = true
+
 	}
 	return nil
 }
+func (s *TestServer) BlockTemplate() (DBMan.BlockTemplate, error) {
+
+	prevHash, err := s.DBMan.GetPrevHash()
+	if err != nil {
+		fmt.Print(err)
+	}
+	height, GetBlockHeightError := s.DBMan.GetBlockHeight()
+	fmt.Printf("Height %d", height)
+	if GetBlockHeightError != nil {
+		fmt.Print(GetBlockHeightError)
+	}
+	transactions, err := s.DBMan.GetMempoolTxns()
+	fmt.Println(transactions)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	template := DBMan.BlockTemplate{
+		Version:       version,
+		Height:        height + 1,
+		Transactions:  transactions,
+		PrevBlockHash: prevHash,
+		MerkleRoot:    "",
+		Bits:          Difficulty,
+		Timestamp:     time.Now().Unix(),
+	}
+	return template, nil
+}
+func HashBlock(header DBMan.BlockHeader) string {
+	headerData := fmt.Sprintf("%f%s%s%d%d%d",
+		header.Version,
+		header.PrevBlockHash,
+		header.MerkleRoot,
+		header.Timestamp,
+		header.Bits,
+		header.Nonce,
+	)
+	// Double SHA-256 hash
+	hash := sha256.Sum256([]byte(headerData))
+	finalHash := sha256.Sum256(hash[:])
+
+	return hex.EncodeToString(finalHash[:])
+}
+
 func (cn *CNode) OnGetDataReqTX(hash string) error {
 	fmt.Printf("INCOMMING-HASH:%s\n", (hash))
 	txn, err := cn.server.DBMan.GetTxnFromMempool(hash)
@@ -366,7 +506,7 @@ func (cn *CNode) OnGetDataReqTX(hash string) error {
 		cn.server.handleError(NewServerError(ErrorDatabase, "error occured trying to get txn from DB", err))
 	}
 
-	encoded, err := cn.Utils.TestEncode(txn)
+	encoded, err := cn.Utils.Encode(txn)
 
 	if err != nil {
 		cn.server.handleError(NewServerError(ErrorInternal, "OnGetDataReqTX error encoding transaction", err))
@@ -395,13 +535,23 @@ func (s *TestServer) handleError(err error) {
 	//Todo Figure out when to restart the proccess and on what premise
 	switch serverErr.Type {
 	case ErrorNetwork:
-		log.Printf("Network error : %v", serverErr)
+		log.Printf("%sNetwork Error%s: %s%s", DarkBlue, Reset, Blue, serverErr)
 	case ErrorDatabase:
-		log.Printf("Database Error : %v", serverErr)
+		log.Printf("%sDatabase Error%s: %s%s", DarkYellow, Yellow, serverErr, Reset)
 	case ErrorProtocol:
-		log.Printf("Protocol Error : %v", serverErr)
+		log.Printf("%sProtocol Error%s: %s%s", DarkPurple, Purple, serverErr, Reset)
 	case ErrorInternal:
-		log.Printf("Internal Error : %v", serverErr)
+		log.Printf("%sInternal Error%s: %s%s", DarkRed, Red, serverErr, Reset)
+	case ErrorNeedsRetry:
+		//verifyBlock with peers
+		//only send to peers who are all caught up // have the maxumu number if blocks
+
+		//!Steps
+		// go to db get the temp blocks
+		// ask them  their block height
+		// whoever has it exculding the node which send these blocks
+		// well we should store thier block height so make em send thier block height
+
 	}
 }
 func (cn *CNode) handler() {
@@ -410,6 +560,7 @@ func (cn *CNode) handler() {
 	for {
 
 		msg, err := decodeMessage(cn.conn)
+
 		if err == io.EOF {
 			break
 		}
@@ -432,7 +583,7 @@ func (cn *CNode) handler() {
 			decoder.Decode(&buff)
 
 			if !cn.ExchangedVersion {
-				if err := cn.SendVerack(); err != nil {
+				if err := cn.SendVerack(int(buff.StartHeight)); err != nil {
 					errMessage := fmt.Sprintf("Error sending version ackowledgement message to peer %v", cn.conn.RemoteAddr())
 					cn.server.handleError(NewServerError(ErrorNetwork, errMessage, err))
 				}
@@ -444,16 +595,25 @@ func (cn *CNode) handler() {
 				cn.Addr = cn.conn.RemoteAddr()
 			}
 		} else if msg.Cammand == byte(GETBLOCKS) {
-			// gotta find a way to call this through server not re intialise it it looks ugly
+			blocks, err := cn.server.DBMan.FromNToLatestHash(string(msg.Data))
 
-			blocks, err, _ := cn.server.DBMan.GetBlocksFromGivenHashTillLatest(string(msg.Data))
 			if err != nil {
 				cn.server.handleError(NewServerError(ErrorDatabase, "error occured Trying to get Blocks from Db for Transaport", err))
 			}
-			length := dataByteLen(blocks)
+			for _, hash := range blocks {
+				fmt.Println(string(hash))
+			}
+			var buff bytes.Buffer
+
+			errorEncode := gob.NewEncoder(&buff).Encode(blocks)
+			if errorEncode != nil {
+				cn.server.handleError(NewServerError(ErrorNetwork, "Error Encoding Hashes", err))
+			}
+
+			length := dataByteLen(buff.Bytes())
 			msg := NewMessage()
-			msg.Cammand = byte(BLOCK)
-			msg.Data = blocks
+			msg.Cammand = byte(HEADERS)
+			msg.Data = buff.Bytes()
 			msg.Length = length
 			encoded := encodeMessage(msg)
 			cn.VSend <- encoded
@@ -475,15 +635,213 @@ func (cn *CNode) handler() {
 			go cn.OnGetDataReqTX(string(msg.Data))
 		} else if msg.Cammand == byte(TX) {
 
-			var txn DBMan.Transaction
-			decodedTxn, err := cn.Utils.TestDecode(msg.Data, &txn)
-			if err != nil {
-				cn.server.handleError(NewServerError(ErrorProtocol, "error decoding message from peer", err))
+			// var txn DBMan.Transaction
+			// decodedTxn, err := cn.Utils.Decode(msg.Data, &txn)
+			// if err != nil {
+			// 	cn.server.handleError(NewServerError(ErrorProtocol, "error decoding message from peer", err))
+			// }
+			//	cn.server.StoreInMempoolAndRelay(decodedTxn)
+		} else if msg.Cammand == byte(BLOCK) {
+			// Make sure to register the Block type before using gob
+			if !cn.block {
+				gob.Register(&DBMan.Block{})
+
+				var block DBMan.Block
+				var buff bytes.Buffer
+				buff.Write(msg.Data) // Ensure msg.Data is a valid Gob-encoded byte slice
+
+				err := gob.NewDecoder(&buff).Decode(&block)
+				if err != nil {
+					cn.server.handleError(NewServerError(ErrorInternal, "Error decoding Block", err))
+				} else {
+					cn.server.ProcessAndStoreNewMinedBlock(block)
+				}
+
 			}
-			cn.server.StoreInMempoolAndRelay(decodedTxn)
+		} else if msg.Cammand == byte(HEADERS) {
+			height, _ := cn.server.DBMan.GetBlockHeight()
+			fmt.Printf("Height of test Server is %d\n", height)
+			// Decode the incoming hashes
+			var hashes []string
+			decoder := gob.NewDecoder(bytes.NewReader(msg.Data))
+			if err := decoder.Decode(&hashes); err != nil {
+				cn.server.handleError(NewServerError(ErrorNetwork, "Error decoding hashes", err))
+				continue
+			}
+
+			var blocksToRequest []string
+			for _, hash := range hashes {
+				exists, err := cn.server.DBMan.IsBlockAlreadyPresent(hash)
+				if err != nil {
+					cn.server.handleError(NewServerError(ErrorDatabase, "Error checking block existence", err))
+					continue
+				}
+				if !exists {
+					blocksToRequest = append(blocksToRequest, hash)
+				}
+			}
+
+			if len(blocksToRequest) > 0 {
+				cn.RequestBlocksForGivenHases(blocksToRequest)
+			}
+		} else if msg.Cammand == byte(BLOCKS) {
+
+			var hashes []string
+			var buff bytes.Buffer
+			buff.Write(msg.Data)
+			// Create a new decoder from the message data
+			decoder := gob.NewDecoder(&buff)
+			if err := decoder.Decode(&hashes); err != nil {
+				fmt.Printf("failed to decode hashes: %v", err)
+			}
+
+			for _, hash := range hashes {
+				fmt.Printf("Received hash: %s\n", hash)
+			}
+
+			blocks, err := cn.server.DBMan.GetBlocksForGivenHashes(hashes)
+			if err != nil {
+				fmt.Printf("failed to get blocks: %v", err)
+			}
+
+			fmt.Printf("Retrieved blocks: %+v\n", blocks)
+		} else if msg.Cammand == byte(REQUESTEDBLOCKS) {
+
+			var blocks []DBMan.Block
+			var buff bytes.Buffer
+			buff.Write(msg.Data)
+			err = gob.NewDecoder(&buff).Decode(&blocks)
+			if err != nil {
+				cn.server.handleError(NewServerError(ErrorNetwork, "Error Decoding Recived Blocks", err))
+			}
+			err = cn.server.ValidateAndStoreNewRecivedBlocks(blocks)
+			if err != nil {
+				cn.server.handleError(NewServerError(ErrorDatabase, "Error Validating Blocks", err))
+			}
 		}
 
 	}
+}
+func (cn *CNode) PrepareAndSendBlocks(blocks []DBMan.Block) error {
+	var buff bytes.Buffer
+	err := gob.NewEncoder(&buff).Encode(blocks)
+	blocksResponseMessage := NewMessage()
+	blocksResponseMessage.Cammand = byte(REQUESTEDBLOCKS)
+	blocksResponseMessage.Length = dataByteLen(buff.Bytes())
+	blocksResponseMessage.Data = buff.Bytes()
+	Encodedblocks := encodeMessage(blocksResponseMessage)
+	cn.VSend <- Encodedblocks
+	return err
+}
+func (cn *CNode) RequestBlocksForGivenHases(hashes []string) {
+
+	var buff bytes.Buffer
+	if err := gob.NewEncoder(&buff).Encode(hashes); err != nil {
+		cn.server.handleError(NewServerError(ErrorNetwork, "Error encoding hashes", err))
+	}
+
+	msg := NewMessage()
+	msg.Cammand = byte(BLOCKS)
+	msg.Data = buff.Bytes()
+	msg.Length = dataByteLen(buff.Bytes())
+
+	encoded := encodeMessage(msg)
+	cn.VSend <- encoded
+
+}
+func (s *TestServer) IsBlockValid(block *DBMan.BlockHeader) bool {
+
+	target := CompactToBig(uint32(block.Bits))
+
+	blockHash := HashBlock(*block)
+
+	blockHashInt := new(big.Int)
+	blockHashInt.SetString(blockHash, 16)
+	return blockHashInt.Cmp(target) == -1
+}
+func (s *TestServer) ValidateAndStoreNewRecivedBlocks(blocks []DBMan.Block) error {
+	for _, block := range blocks {
+		valid := s.IsBlockValid(&block.Header)
+		if !valid {
+			errorMessage := fmt.Errorf("recived Block with %s is Invalid rejecting", block.Hash)
+			return errorMessage
+			// s.handleError(NewServerError(ErrorNetwork, errorMessage, nil))
+		}
+	}
+	for _, block := range blocks {
+		err := s.DBMan.StoreBlock(block)
+		//lastBlock := blocks[len(blocks)-1]
+
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *TestServer) ProcessAndStoreNewMinedBlock(block DBMan.Block) (bool, error) {
+	if s.IsBlockValid(&block.Header) {
+		fmt.Println(true)
+		for _, txn := range block.Transactions {
+			//Todo check if any of the utxo is absent if so reject
+			for _, inputs := range txn.Inputs {
+				exist, err := s.DBMan.UTXOExists(inputs.Id)
+				if !exist {
+					fmt.Println(err)
+					return false, fmt.Errorf("rejecting Block Txn With Invalid Utxo Inputs error occured ON UTXO %s", inputs.Id)
+				}
+			}
+		}
+		for _, txn := range block.Transactions {
+			//Todo check if any of the utxo is absent if so reject
+			for _, inputs := range txn.Inputs {
+				err := s.DBMan.DeleteUtxo(inputs.Id)
+				if err != nil {
+					return false, fmt.Errorf("error deleting Inputs %w", err)
+				}
+			}
+
+			for _, outputSenderUtxo := range txn.Outputs {
+				s.DBMan.StoreUTXO(outputSenderUtxo.Id, outputSenderUtxo)
+			}
+			err := s.DBMan.StoreTransaction(txn.TxnHash, txn)
+			if err != nil {
+				return false, fmt.Errorf("error Storing txns %w", err)
+			}
+		}
+		err := s.DBMan.StoreBlock(block)
+
+		if err != nil {
+			return false, fmt.Errorf("error storing block with hash %s %w", block.Hash, err)
+		}
+
+		s.BroadCasteBlock(&block)
+		s.Log()
+		return true, nil
+	}
+
+	return false, fmt.Errorf("Error Invalid block")
+}
+
+func (s *TestServer) BroadCasteBlock(block *DBMan.Block) error {
+	newBlock := NewMessage()
+
+	var buff bytes.Buffer
+	err := gob.NewEncoder(&buff).Encode(block)
+	if err != nil {
+		s.handleError(NewServerError(ErrorInternal, "Error Encoding Block", err))
+	}
+
+	length := dataByteLen(buff.Bytes())
+	newBlock.Cammand = byte(BLOCK)
+	newBlock.Length = length
+	newBlock.Data = buff.Bytes()
+
+	encodedBlock := encodeMessage(newBlock)
+	for _, peer := range s.peers {
+		peer.VSend <- encodedBlock
+		peer.block = true
+	}
+	return nil
 }
 
 func (cn *CNode) RequestTxn(txn []byte) error {
@@ -497,7 +855,7 @@ func (cn *CNode) RequestTxn(txn []byte) error {
 	cn.VSend <- encodedGetDataRequest
 	return nil
 }
-func (s *TestServer) RelayToKnowPeers(transaction TestDBMan.Transaction) {
+func (s *TestServer) RelayToKnowPeers(transaction DBMan.Transaction) {
 	// first send the hash
 	// Todo need more logs this sucks
 	newRelay := NewMessage()
@@ -507,26 +865,24 @@ func (s *TestServer) RelayToKnowPeers(transaction TestDBMan.Transaction) {
 	newRelay.Data = data
 	newRelay.Length = length
 	encoded := encodeMessage(newRelay)
-	for _, peer := range s.peers {
-		peer.VSend <- encoded
+	if len(s.peers) > 0 {
+		for _, peer := range s.peers {
+			peer.VSend <- encoded
+		}
 	}
 
 }
 
 // ! if added call a relay function and send the txn hashes in mempool and they will check in their db do they already have any of the given txn that maches the hashes provided.
 // ! or give them all and let em handle theyll just drop it if they already have it i takes one call so i think its faster ill still go with first this one will end up sending alot of redundant data across and the overhead will be insane
-func (s *TestServer) StoreInMempoolAndRelay(transaction TestDBMan.Transaction) (error, bool) {
-
-	added, err := s.DBMan.VerifyTransaction(transaction)
+func (s *TestServer) StoreInMempoolAndRelay(ctx context.Context, transaction DBMan.Transaction) (error, bool) {
+	log.Println("StoreInMempoolAndRelay: Starting")
+	added, err := s.DBMan.VerifyTransaction(ctx, transaction)
 	if err != nil {
-		return NewServerError(ErrorDatabase, "error verifying transaction", err), false
-	}
-	if !added {
+		log.Printf("StoreInMempoolAndRelay: Error verifying transaction: %v", err)
 		return err, false
 	}
-	if added {
-		s.RelayToKnowPeers(transaction)
-	}
+	log.Printf("StoreInMempoolAndRelay: Transaction verified. Added: %v", added)
 	return nil, added
 }
 func (s *TestServer) LogPeers() {
@@ -538,7 +894,11 @@ func (s *TestServer) LogPeers() {
 		fmt.Printf("%v\n", p.LastServed)
 	}
 }
-
+func (s *TestServer) Log() {
+	time.Sleep(5 * time.Second)
+	fmt.Println("Sleeping 5 secs before logging blocks")
+	s.DBMan.LogAllTheBlocks()
+}
 func isTransportOver(data string) bool {
 	return strings.HasSuffix(data, StopCharacter)
 }
@@ -575,7 +935,7 @@ func InItServer() (TestServer, error) {
 	log.Println("Starting server application")
 	//! Problem we are intialising db too many times in handler its ugly after test fix it
 	//Todo
-	db, err := TestDBMan.GetDB("../testDB")
+	db, err := DBMan.InitDB("../testDB")
 	if err != nil {
 		return TestServer{}, fmt.Errorf("error occurred initializing db: %w", err)
 	}
@@ -589,6 +949,8 @@ func InItServer() (TestServer, error) {
 	server.maxPeerLimit = 20
 
 	log.Printf("Server configured with max peer limit: %d", server.maxPeerLimit)
-	go func() { server.Run() }()
+	go func() {
+		server.Run()
+	}()
 	return *server, nil
 }

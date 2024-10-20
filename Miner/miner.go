@@ -139,7 +139,7 @@ func CompactToBig(compact uint32) *big.Int {
 }
 
 func HashBlock(header DBMan.BlockHeader) string {
-	headerData := fmt.Sprintf("%f%s%s%d%d%d%f",
+	headerData := fmt.Sprintf("%f%s%s%d%d%d",
 		header.Version,
 		header.PrevBlockHash,
 		header.MerkleRoot,
@@ -213,7 +213,7 @@ func (m *Miner) ProofOfWork(block *DBMan.BlockHeader) string {
 			fmt.Printf("Valid hash found: %s with nonce: %d\n", hash, block.Nonce)
 			return hash
 		}
-		fmt.Printf("current hash %s current nonce %d\n", hash, block.Nonce)
+		//fmt.Printf("current hash %s current nonce %d\n", hash, block.Nonce)
 		block.Nonce++
 
 	}
@@ -531,41 +531,96 @@ func (m *Miner) SubmitBlock(urlStr string, block DBMan.Block) error {
 		return fmt.Errorf("unexpected error occured %d", resp.StatusCode)
 	}
 	m.casheMan.ClearDB()
-	fmt.Print("block submitted successfully")
+	fmt.Println("block submitted successfully")
 	return nil
 }
 func main() {
 	casheMan, err := MinerCacheMan.NewMinerCacheMan()
 	if err != nil {
-		fmt.Printf("Error Initlizing DB %w", err)
+		fmt.Printf("Error Initlizing DB %v", err)
 	}
 	miner := &Miner{
 		casheMan: casheMan,
 	}
-	// if _, err := miner.casheMan.GetBlockTemplate(); err != nil {
+
 	url := "http://localhost:8087/GetBlockTemplate"
 	blockTemplate, err := miner.GetBlockTemplate(url)
 	if err != nil {
 		log.Fatalf("Failed to get block template: %v", err)
 	}
 	miner.casheMan.SetBlockTemplate(blockTemplate)
-	fmt.Printf("Length of what we got is %d", len(blockTemplate.Transactions))
-	//}
 
 	block, err := miner.MineBlock()
 	urlSend := "http://localhost:8087/SubmitBlock"
-	// if data := miner.casheMan.GetBlockTemplate(); data == nil{
 
-	// }
 	sumbitError := miner.SubmitBlock(urlSend, *block)
 	if sumbitError != nil {
-		fmt.Printf("Error Submitting block %w", sumbitError)
+		fmt.Printf("Error Submitting block %v", sumbitError)
 	}
-	fmt.Printf("block TimeStamp %d", block.Header.Timestamp)
 
 	if err != nil {
-		fmt.Printf("Error MineBlock %w\n", err)
+		fmt.Printf("Error MineBlock %v\n", err)
 	}
-	fmt.Println("Mined block transactions:")
 
 }
+
+// func (s *Server) handleCallSeeder() {
+// 	url := `http://localhost:8082/ReadyToServe`
+// 	jsonData := `{
+// 		"address": "127.0.0.1:8081",
+// 		"services": {
+// 			"doesEverything": true
+// 		}
+// 	}`
+
+// 	resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(jsonData)))
+// 	if err != nil {
+// 		fmt.Println("Error sending request to seeder:", err)
+// 		s.Close()
+// 		log.Fatal("Server stopped due to seeder communication failure")
+// 	}
+// 	defer resp.Body.Close()
+
+// 	if resp.StatusCode != http.StatusOK {
+// 		fmt.Printf("Unexpected status code from seeder: %d\n", resp.StatusCode)
+// 		s.Close()
+// 		log.Fatal("Server stopped due to unexpected response from seeder")
+// 	}
+
+// 	go s.getActivePeers()
+// }
+
+// // getActivePeers sends a request to the seeder to get a list of active peers
+// func (s *Server) getActivePeers() {
+// 	url := `http://localhost:8082/NeedPeers`
+// 	jsonData := `{
+// 		"servicesNeeded": {
+// 			"doesEverything": true
+// 		}
+// 	}`
+
+// 	resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(jsonData)))
+// 	if err != nil {
+// 		fmt.Println("Error getting active peers:", err)
+// 		s.Close()
+// 		return
+// 	}
+// 	defer resp.Body.Close()
+
+// 	body, err := io.ReadAll(resp.Body)
+// 	if err != nil {
+// 		fmt.Println("Error reading response body:", err)
+// 		return
+// 	}
+
+// 	var addresses []string
+// 	err = json.Unmarshal(body, &addresses)
+// 	if err != nil {
+// 		fmt.Print(err)
+// 	}
+// 	for _, addr := range addresses {
+// 		//Make addr man and tell it to store it
+// 		fmt.Print(addr)
+// 	}
+
+// }

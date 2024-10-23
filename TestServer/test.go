@@ -198,7 +198,7 @@ const (
 	CategoryInternal
 )
 
-func (em *TeatServer) ErrorCategory(code ErrorCode) ErrorCategory {
+func (em *TestServer) ErrorCategory(code ErrorCode) ErrorCategory {
 	switch {
 	case code >= 1000 && code < 2000:
 		return CategoryNetwork
@@ -238,7 +238,7 @@ type RetryContext struct {
 	Attempts   int
 	MaxRetries int
 }
-type TeatServer struct {
+type TestServer struct {
 	DBMan            *DBMan.DBman
 	host             string
 	port             string
@@ -318,7 +318,7 @@ type CNode struct {
 	ExchangedVersion bool
 	LastServed       time.Time
 	Utils            *Utils.Utils
-	server           *TeatServer
+	server           *TestServer
 	block            bool
 	IsInBound        bool
 	SentBytes        uint16
@@ -332,7 +332,7 @@ func (cn *CNode) Close() {
 	close(cn.VSend)
 	cn.conn.Close()
 }
-func NewCNode(server *TeatServer) CNode {
+func NewCNode(server *TestServer) CNode {
 	VSend := make(chan []byte)
 	return CNode{
 		Id:               GenerateRandomId(),
@@ -372,8 +372,8 @@ type Config struct {
 }
 
 // New initializes a new server with the given configuration
-func New(config *Config) *TeatServer {
-	return &TeatServer{
+func New(config *Config) *TestServer {
+	return &TestServer{
 		host:             config.Host,
 		port:             config.Port,
 		DBMan:            config.DBMan,
@@ -390,7 +390,7 @@ func New(config *Config) *TeatServer {
 
 var ServerAddr string
 
-func (s *TeatServer) Run() {
+func (s *TestServer) Run() {
 	listener, err := net.Listen("tcp4", s.host+":"+s.port)
 	if err != nil {
 		s.ErrorChan <- *NewServerError(ErrorNetwork, "error starting server Err", err)
@@ -449,7 +449,7 @@ func (s *TeatServer) Run() {
 		}
 	}
 }
-func (s *TeatServer) Close() {
+func (s *TestServer) Close() {
 	close(s.done)
 	s.listener.Close()
 	for _, peer := range s.peers {
@@ -457,7 +457,7 @@ func (s *TeatServer) Close() {
 	}
 }
 
-func (s *TeatServer) Dial(addr string) bool {
+func (s *TestServer) Dial(addr string) bool {
 	log.Printf("Attempting to dial %s", addr)
 	conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
 	if err != nil {
@@ -566,7 +566,7 @@ func (cn *CNode) SendVerack(height int) error {
 
 	return nil
 }
-func (s *TeatServer) AttemptToEvictConnection() (bool, error) {
+func (s *TestServer) AttemptToEvictConnection() (bool, error) {
 	var totalLatency time.Duration
 	var inboundPeers int
 
@@ -656,7 +656,7 @@ func (cn *CNode) SendVersionMessage() error {
 	}
 	return nil
 }
-func (s *TeatServer) BlockTemplate() (DBMan.BlockTemplate, error) {
+func (s *TestServer) BlockTemplate() (DBMan.BlockTemplate, error) {
 
 	prevHash, err := s.DBMan.GetPrevHash()
 	if err != nil {
@@ -898,7 +898,7 @@ func (cn *CNode) handler() {
 			if err != nil {
 				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error Validating Blocks", err)
 			}
-			cn.Latency = cn.Timer.ElapsedTime()
+			cn.server.LogBlocksAfterRetrival()
 
 		} else if msg.Cammand == byte(PING) {
 			cn.SendPong()
@@ -909,7 +909,11 @@ func (cn *CNode) handler() {
 
 	}
 }
-
+func (s *TestServer) LogBlocksAfterRetrival() {
+	fmt.Printf("Sleeping for 5 secs before loggin Retrived blocks\n")
+	time.Sleep(5 * time.Second)
+	s.DBMan.LogAllTheBlocks()
+}
 func (cn *CNode) ValidateAndStoreNewRecivedBlocks(blocks []DBMan.Block) error {
 	for _, block := range blocks {
 		valid := cn.server.IsBlockValid(&block.Header)
@@ -1002,7 +1006,7 @@ func (cn *CNode) RequestBlocksForGivenHases(hashes []string) {
 	encodedMessage := encodeMessage(newBlockRequestMessage)
 	cn.VSend <- encodedMessage
 }
-func (s *TeatServer) IsBlockValid(block *DBMan.BlockHeader) bool {
+func (s *TestServer) IsBlockValid(block *DBMan.BlockHeader) bool {
 
 	target := CompactToBig(uint32(block.Bits))
 
@@ -1012,7 +1016,7 @@ func (s *TeatServer) IsBlockValid(block *DBMan.BlockHeader) bool {
 	blockHashInt.SetString(blockHash, 16)
 	return blockHashInt.Cmp(target) == -1
 }
-func (s *TeatServer) ProcessAndStoreNewMinedBlock(block DBMan.Block) (bool, error) {
+func (s *TestServer) ProcessAndStoreNewMinedBlock(block DBMan.Block) (bool, error) {
 	if s.IsBlockValid(&block.Header) {
 		fmt.Println(true)
 		for _, txn := range block.Transactions {
@@ -1054,7 +1058,7 @@ func (s *TeatServer) ProcessAndStoreNewMinedBlock(block DBMan.Block) (bool, erro
 	return false, fmt.Errorf("Error Invalid block")
 }
 
-func (s *TeatServer) BroadCasteBlock(block *DBMan.Block) error {
+func (s *TestServer) BroadCasteBlock(block *DBMan.Block) error {
 	newBlock := NewMessage()
 
 	var buff bytes.Buffer
@@ -1087,7 +1091,7 @@ func (cn *CNode) RequestTxn(txn []byte) error {
 	cn.VSend <- encodedGetDataRequest
 	return nil
 }
-func (s *TeatServer) RelayToKnowPeers(transaction DBMan.Transaction) error {
+func (s *TestServer) RelayToKnowPeers(transaction DBMan.Transaction) error {
 	// first send the hash
 	// Todo need more logs this sucks
 	newRelay := NewMessage()
@@ -1110,7 +1114,7 @@ func (s *TeatServer) RelayToKnowPeers(transaction DBMan.Transaction) error {
 
 // ! if added call a relay function and send the txn hashes in mempool and they will check in their db do they already have any of the given txn that maches the hashes provided.
 // ! or give them all and let em handle theyll just drop it if they already have it i takes one call so i think its faster ill still go with first this one will end up sending alot of redundant data across and the overhead will be insane
-func (s *TeatServer) StoreInMempoolAndRelay(ctx context.Context, transaction DBMan.Transaction) (error, bool) {
+func (s *TestServer) StoreInMempoolAndRelay(ctx context.Context, transaction DBMan.Transaction) (error, bool) {
 	log.Println("StoreInMempoolAndRelay: Starting")
 	added, err := s.DBMan.VerifyTransaction(ctx, transaction)
 	if err != nil {
@@ -1120,7 +1124,7 @@ func (s *TeatServer) StoreInMempoolAndRelay(ctx context.Context, transaction DBM
 	log.Printf("StoreInMempoolAndRelay: Transaction verified. Added: %v", added)
 	return nil, added
 }
-func (s *TeatServer) LogPeers() {
+func (s *TestServer) LogPeers() {
 	time.Sleep(10 * time.Second)
 	for _, p := range s.peers {
 		fmt.Print("Peers:\n")
@@ -1162,7 +1166,7 @@ func (cn *CNode) write() {
 		log.Printf("Message flushed to %s", cn.conn.RemoteAddr())
 	}
 }
-func (s *TeatServer) ShutDown() {
+func (s *TestServer) ShutDown() {
 	if s.listener != nil {
 		fmt.Printf("Closing Down Listners\n")
 		s.listener.Close()
@@ -1174,7 +1178,7 @@ func (s *TeatServer) ShutDown() {
 
 }
 
-func (s *TeatServer) HandleCallSeeder() {
+func (s *TestServer) HandleCallSeeder() {
 	url := `http://localhost:8080/ReadyToServe`
 	jsonData := `{
 		"address": "127.0.0.1:7778",
@@ -1201,7 +1205,7 @@ func (s *TeatServer) HandleCallSeeder() {
 }
 
 // getActivePeers sends a request to the seeder to get a list of active peers
-func (s *TeatServer) GetActivePeers() {
+func (s *TestServer) GetActivePeers() {
 	url := `http://localhost:8080/NeedPeers`
 	jsonData := `{
 		"servicesNeeded": {
@@ -1234,19 +1238,19 @@ func (s *TeatServer) GetActivePeers() {
 
 }
 
-func InItServer() (*TeatServer, error) {
+func InItServer() (*TestServer, error) {
 	log.Println("Starting server application")
 	//! Problem we are intialising db too many times in handler its ugly after test fix it
 	//Todo
 	db, err := DBMan.InitDB("./TestServer.db")
 	if err != nil {
-		return &TeatServer{}, fmt.Errorf("error occurred initializing db: %w", err)
+		return &TestServer{}, fmt.Errorf("error occurred initializing db: %w", err)
 	}
 	//ctx, _ := context.WithCancel(context.Background())
 
 	addMan, err := Addrman.GetAddrMan("../Addr.db")
 	if err != nil {
-		return &TeatServer{}, fmt.Errorf("Error Stating AddrMan %v", err)
+		return &TestServer{}, fmt.Errorf("Error Stating AddrMan %v", err)
 	}
 	config := Config{
 		Host:             "127.0.0.1",
@@ -1266,7 +1270,7 @@ func InItServer() (*TeatServer, error) {
 	return server, nil
 }
 
-func (em *TeatServer) Log(err error) {
+func (em *TestServer) Log(err error) {
 	serverErr, ok := err.(*ServerError)
 	if !ok {
 		fmt.Println("Error is not of type *ServerError:", err)
@@ -1302,7 +1306,7 @@ func (rc RetryContext) String() string {
 	}
 	return string(data)
 }
-func (s *TeatServer) SendRetryHandler() {
+func (s *TestServer) SendRetryHandler() {
 	s.Wg.Add(1)
 	defer s.Wg.Done()
 
@@ -1348,7 +1352,7 @@ func NewServerError(errType ErrorType, message string, err error) *ServerError {
 	}
 }
 
-func (s *TeatServer) EnqueueRetry(peerId int, metadata []DBMan.Block) error {
+func (s *TestServer) EnqueueRetry(peerId int, metadata []DBMan.Block) error {
 	select {
 	case s.RetrySendQueue <- RetryContext{
 		PeerId:     peerId,

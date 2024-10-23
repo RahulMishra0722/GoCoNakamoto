@@ -283,6 +283,13 @@ func NewVersionMessage() VersionMessage {
 		Relay:       true,
 	}
 }
+func NewServerError(errType ErrorType, message string, err error) *ServerError {
+	return &ServerError{
+		Type:    errType,
+		Message: message,
+		Err:     err,
+	}
+}
 
 const (
 	StopCharacter = "\r\n\r\n"
@@ -430,7 +437,7 @@ func (s *Server) Run() {
 				go newNode.PingHandler(uint8(s.PingingDuration))
 				go s.SendRetryHandler()
 			} else {
-				if evited, evictionError := s.AttemptToEvictConnection(); evited && evictionError != nil {
+				if evited, evictionError := s.AttemptToEvictConnection(); evited && evictionError == nil {
 					newNode := NewCNode(s)
 					newNode.conn = conn
 					newNode.IsInBound = true
@@ -565,7 +572,7 @@ func (s *Server) AttemptToEvictConnection() (bool, error) {
 	stdDeviation := time.Duration(math.Sqrt(variance))
 	fmt.Println("Standard Deviation:", stdDeviation)
 
-	evictionThreshold := avg + stdDeviation
+	evictionThreshold := avg + 2*stdDeviation
 	fmt.Println("Eviction Threshold:", evictionThreshold)
 
 	var PeersUnderEvictionThreshold []*CNode
@@ -1343,14 +1350,6 @@ func (s *Server) SendRetryHandler() {
 			}
 		}
 
-	}
-}
-
-func NewServerError(errType ErrorType, message string, err error) *ServerError {
-	return &ServerError{
-		Type:    errType,
-		Message: message,
-		Err:     err,
 	}
 }
 

@@ -1,6 +1,8 @@
 package RpcServer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/RahulMishra0722/GC/DBMan"
 	"github.com/RahulMishra0722/GC/Server"
+	"github.com/btcsuite/btcd/btcec"
 )
 
 type RpcServer struct {
@@ -16,6 +19,44 @@ type RpcServer struct {
 	DBman   *DBMan.DBman
 	Mempool map[string]DBMan.Transaction
 }
+
+func ValidateSignature(pubKeyString string, transactionHash string, signatureHex string) (bool, error) {
+
+	pubKeyBytes, err := hex.DecodeString(pubKeyString)
+	if err != nil {
+		return false, fmt.Errorf("error decoding public key: %v", err)
+	}
+
+	pubkey, err := btcec.ParsePubKey(pubKeyBytes, btcec.S256())
+	if err != nil {
+		return false, fmt.Errorf("error parsing public key: %v", err)
+	}
+
+	signatureBytes, err := hex.DecodeString(signatureHex)
+	if err != nil {
+		return false, fmt.Errorf("error decoding signature: %v", err)
+	}
+
+	signature, err := btcec.ParseDERSignature(signatureBytes, btcec.S256())
+	if err != nil {
+		return false, fmt.Errorf("error parsing signature: %v", err)
+	}
+
+	txnHashBytes, err := hex.DecodeString(transactionHash)
+	if err != nil {
+		return false, fmt.Errorf("error decoding transaction hash: %v", err)
+	}
+	msgHash := sha256.Sum256(txnHashBytes)
+
+	valid := signature.Verify(msgHash[:], pubkey)
+	fmt.Print(valid)
+	if !valid {
+		fmt.Print("\n", "Signature failed", "\n")
+	}
+	fmt.Print("\n", "Signature Succeeded", "\n")
+	return valid, nil
+}
+
 type GetBalance struct {
 	PrivateKey string `json:"PrivateKey"`
 }
@@ -92,7 +133,13 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 
 	req := reqOuter.Transaction
 	// log.Printf("SendTransaction: Received transaction: %+v", req)
-
+	if valid, err := ValidateSignature(req.Sender, req.TxnHash, req.Signature); !valid && err == nil {
+		response := map[string]interface{}{
+			"Response": "Invalid Signature transaction is being rejected",
+		}
+		w.WriteHeader(http.StatusNotAcceptable)
+		json.NewEncoder(w).Encode(response)
+	}
 	rpc.Connman.DBMan.AddToMempool(req.TxnHash, req)
 	response := map[string]interface{}{
 		"Response": "We Have Recived Your Transaction wait till The Node will verifies your transaction",
@@ -130,7 +177,7 @@ func (rpc *RpcServer) SubmitBlock(w http.ResponseWriter, r *http.Request) {
 
 	for _, txn := range reqBlock.Transactions {
 		for _, opt := range txn.Outputs {
-			fmt.Printf("Value %v", opt.Output.Value)
+			fmt.Printf("Valuex %v", opt.Output.Value)
 		}
 	}
 	if err != nil {
@@ -139,7 +186,7 @@ func (rpc *RpcServer) SubmitBlock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if ok {
-		fmt.Print("STORED YOHOO")
+		fmt.Printf("Block Stored Successfully \n")
 	}
 	// m.DBman.StoreUTXO(outputSenderUtxo.Id, outputSenderUtxo)
 }

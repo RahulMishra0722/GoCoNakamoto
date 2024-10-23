@@ -98,13 +98,29 @@ type TxOutput struct {
 	Value        float64 // Amount in satoshis (1 BTC = 100,000,000 satoshis) well  wont take this route of manging floats it gets trick very fast
 	ScriptPubKey string  // Locking script, setting conditions to spend this output (e.g., requires a signature)
 }
-
+type Blocks []Block
 type Block struct {
 	Height       int
 	Header       BlockHeader   // The block header
 	Hash         string        // Hash of the block
 	Transactions []Transaction // List of other transactions in the block
 	Difficulty   int
+}
+
+func (b *Blocks) Serialize() []byte {
+	var buff bytes.Buffer
+	gob.NewEncoder(&buff).Encode(b)
+	return buff.Bytes()
+}
+func Deserialize(data []byte) (Blocks, error) {
+	var blocks Blocks
+	err := gob.NewDecoder(bytes.NewReader(data)).Decode(&blocks)
+	return blocks, err
+}
+func (b *Block) Serialize() []byte {
+	var buff bytes.Buffer
+	gob.NewEncoder(&buff).Encode(b)
+	return buff.Bytes()
 }
 
 func SerializeUnserializableData(input interface{}) ([]byte, error) {
@@ -361,7 +377,11 @@ func InitDB(path string) (*DBman, error) {
 
 	return db, nil
 }
-
+func (b *Block) BytesLen() uint16 {
+	var buff bytes.Buffer
+	gob.NewEncoder(&buff).Encode(b)
+	return uint16(buff.Len())
+}
 func (tx *Transaction) CalculateHash() string {
 
 	data := tx.BlockHash + tx.TxnHash + string(tx.Sender) + string(tx.Receiver) + tx.Signature
@@ -1333,3 +1353,41 @@ func (dm *DBman) ListAllUTXOs() error {
 		return nil
 	})
 }
+
+// func (dm *DBman) SetFailedToSendBlocks(peerId int, blocks Blocks) error {
+// 	return dm.db.Update(func(tx *bbolt.Tx) error {
+// 		failedBlocks := tx.Bucket([]byte("TransportFailedBlocks"))
+// 		if failedBlocks != nil {
+// 			return fmt.Errorf("error Bucket TransportFailedBlocks Does not exist DB it issue")
+// 		}
+// 		blocks := blocks.Serialize()
+
+// 		err := failedBlocks.Put([]byte(string(peerId)), blocks)
+
+// 		return err
+// 	})
+// }
+// func (dm *DBman) GetFailedToSendBlocks(peerId int) ([]Block, error) {
+// 	var blocks []Block
+// 	var err error
+// 	dm.db.View(func(tx *bbolt.Tx) error {
+// 		failedBlocks := tx.Bucket([]byte("TransportFailedBlocks"))
+// 		if failedBlocks != nil {
+// 			return fmt.Errorf("error Bucket TransportFailedBlocks Does not exist DB it issue")
+// 		}
+
+// 		data := failedBlocks.Get([]byte(string(peerId)))
+// 		if data != nil {
+// 			return fmt.Errorf("blocks for peer doesnt exists")
+// 		}
+// 		blocks, err = Deserialize(data)
+// 		if err != nil {
+// 			return fmt.Errorf("error Deseralising Blocks From Failed to send blocks storage")
+// 		}
+// 		return err
+// 	})
+// 	if err != nil {
+// 		return []Block{}, fmt.Errorf("error occured trying to get failed to transaport blocks from db for peer %d", peerId)
+// 	}
+// 	return blocks, err
+// }

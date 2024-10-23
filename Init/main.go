@@ -4,12 +4,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"time"
 
 	"github.com/RahulMishra0722/GC/DBMan"
 	"github.com/RahulMishra0722/GC/RpcServer"
 	"github.com/RahulMishra0722/GC/Server"
-	"github.com/RahulMishra0722/GC/TestServer"
 )
 
 func CORSMiddleware(next http.Handler) http.Handler {
@@ -19,13 +17,11 @@ func CORSMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-		// Handle preflight requests
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// Call the next handler
 		next.ServeHTTP(w, r)
 	})
 }
@@ -35,13 +31,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error occurred initializing server: %v", err)
 	}
-	ts, err := TestServer.InItServer()
-	if err != nil {
-		log.Fatalf("Error occurred initializing server: %v", err)
-	}
-	ts.DBMan.LogAllTheBlocks()
 
-	rpc := RpcServer.NewRpcServer(&server, server.DBMan, make(map[string]DBMan.Transaction))
+	rpc := RpcServer.NewRpcServer(server, server.DBMan, make(map[string]DBMan.Transaction))
 
 	router := http.NewServeMux()
 	router.HandleFunc("/GetBalance", rpc.GetBalanceHandler)
@@ -49,10 +40,8 @@ func main() {
 	router.HandleFunc("/SubmitBlock", rpc.SubmitBlock)
 	router.HandleFunc("/GetBlockTemplate", rpc.GetBlockTemplate)
 
-	// Wrap the router with the CORS middleware
 	corsRouter := CORSMiddleware(router)
 
-	// Start HTTP server in a goroutine
 	go func() {
 		log.Println("Starting HTTP server on :8087")
 		err := http.ListenAndServe(":8087", corsRouter)
@@ -60,12 +49,17 @@ func main() {
 			log.Fatalf("Error starting HTTP server: %v", err)
 		}
 	}()
+	go server.SendRetryHandler()
+	go server.HandleCallSeeder()
 
-	log.Println("Starting server application")
-
-	fmt.Println("Sleeping for 2 seconds before calling")
-	time.Sleep(2 * time.Second)
-	server.Dial("127.0.0.1:8081")
+	addrMap, err := server.AddrMan.GetAddr()
+	if err != nil {
+		fmt.Printf("error getting addr %v", err)
+	}
+	for _, addr := range addrMap {
+		go server.Dial(addr)
+	}
+	go server.DBMan.LogAllTheBlocks()
 
 	select {}
 }

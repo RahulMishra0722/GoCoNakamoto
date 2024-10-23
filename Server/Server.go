@@ -12,12 +12,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"math/rand"
 	"net"
+	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/RahulMishra0722/GC/Addrman"
 	"github.com/RahulMishra0722/GC/DBMan"
 	"github.com/RahulMishra0722/GC/Utils"
 )
@@ -73,7 +77,7 @@ const (
  Exponent = 30
  Left shift by 8 * (30 - 3) = 8 * 27 = 216 bits
 
- This means the coefficient (65535) is multiplied by 2^216.
+ This means the coefficient (65535) is multiplied by 2^216 reason? its equivilant to shifting it by 216 places.
 
  The result is a large target value, making it easier to find a valid hash and since our mining function finds hashes target lower difficulty target
  having a bigger number will increase our chances of getting a valid block hash
@@ -194,7 +198,7 @@ const (
 	CategoryInternal
 )
 
-func (em *ErrorMan) ErrorCategory(code ErrorCode) ErrorCategory {
+func (em *Server) ErrorCategory(code ErrorCode) ErrorCategory {
 	switch {
 	case code >= 1000 && code < 2000:
 		return CategoryNetwork
@@ -229,20 +233,25 @@ type ServerError struct {
 
 // RetryContext holds information needed for retry attempts
 type RetryContext struct {
-	PeerId   int
-	Metadata []DBMan.Block
+	PeerId     int
+	Metadata   []DBMan.Block
+	Attempts   int
+	MaxRetries int
 }
-
 type Server struct {
-	DBMan        *DBMan.DBman
-	host         string
-	port         string
-	peers        []*CNode
-	listener     net.Listener
-	done         chan struct{}
-	maxPeerLimit int
-	ErrorMan     *ErrorMan
-	cancel       context.CancelFunc
+	DBMan            *DBMan.DBman
+	host             string
+	port             string
+	peers            []*CNode
+	listener         net.Listener
+	done             chan struct{} // We'll use this for shutdown signaling
+	maxPeerLimit     int
+	RetrySendQueue   chan RetryContext
+	ErrorChan        chan ServerError
+	Wg               sync.WaitGroup
+	AddrMan          *Addrman.Addrman
+	maxOutBoundPeers int
+	PingingDuration  int
 }
 type VersionMessage struct {
 	Version     float64
@@ -286,6 +295,18 @@ type Message struct {
 	Length  uint16
 	Data    []byte
 }
+type Timer struct {
+	start time.Time
+}
+
+func NewTimer() *Timer {
+	return &Timer{
+		start: time.Now(),
+	}
+}
+func (t *Timer) ElapsedTime() time.Duration {
+	return time.Since(t.start)
+}
 
 // CNode represents a client node in the network
 type CNode struct {
@@ -299,6 +320,11 @@ type CNode struct {
 	Utils            *Utils.Utils
 	server           *Server
 	block            bool
+	IsInBound        bool
+	SentBytes        uint16
+	RecievedBytes    uint16
+	Timer            *Timer
+	Latency          time.Duration
 }
 
 func (cn *CNode) Close() {
@@ -319,37 +345,56 @@ func NewCNode(server *Server) CNode {
 		Utils:            &Utils.Utils{},
 		server:           server,
 		block:            false,
+		RecievedBytes:    0,
+		SentBytes:        0,
+		IsInBound:        false,
+		Timer:            NewTimer(),
+		Latency:          0,
 	}
 }
 
+// Todo Let The functions being called Take care of errors themselves unless theres no way around it make em right to the error chan so everything can be run on go routines
+//Todo Ping Pong for cleaning up inactive node since our seeder is not doing it anymore
 // Todo Frame messages
 // Todo when a tx is requested back from the peer it will send it to to its know peers and one of them is us and
 // * thus itll send back what we sent them thats redundunt we wont let it in ofc because we check if its in the mempool already
 // Todo [add another check if it has already been mined been mined in a block already]
+
+// Todo Keep alive ticker check if the connection has closed if so close/ remove em so new peers can join
 // Config represents server configuration
 type Config struct {
-	Host     string
-	Port     string
-	DBMan    *DBMan.DBman
-	ErrorMan *ErrorMan
+	Host             string
+	Port             string
+	DBMan            *DBMan.DBman
+	MaxPeerLimit     int
+	MaxOutBoundPeers int
+	Addrman          *Addrman.Addrman
+	PingingDuration  int
 }
 
 // New initializes a new server with the given configuration
 func New(config *Config) *Server {
 	return &Server{
-		host:     config.Host,
-		port:     config.Port,
-		DBMan:    config.DBMan,
-		ErrorMan: config.ErrorMan,
-		done:     make(chan struct{}),
+		host:             config.Host,
+		port:             config.Port,
+		DBMan:            config.DBMan,
+		done:             make(chan struct{}),
+		RetrySendQueue:   make(chan RetryContext, 100),
+		ErrorChan:        make(chan ServerError, 100),
+		Wg:               sync.WaitGroup{},
+		AddrMan:          config.Addrman,
+		maxPeerLimit:     config.MaxPeerLimit,
+		maxOutBoundPeers: config.MaxOutBoundPeers,
+		PingingDuration:  config.PingingDuration,
 	}
 }
 
-var ServerAddr string // Run starts the server and listens for incoming connections
+var ServerAddr string
+
 func (s *Server) Run() {
 	listener, err := net.Listen("tcp4", s.host+":"+s.port)
 	if err != nil {
-		s.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "error starting server Err", err)
+		s.ErrorChan <- *NewServerError(ErrorNetwork, "error starting server Err", err)
 	}
 	s.listener = listener
 	defer listener.Close()
@@ -358,28 +403,50 @@ func (s *Server) Run() {
 
 	for {
 		select {
-		case <-s.ErrorMan.ctx.Done():
-			s.ShutDown()
 		case <-s.done:
-			log.Println("Server is shutting down")
+			s.ShutDown()
 			return
 		default:
+
 			conn, err := listener.Accept()
 
 			if err != nil {
-				cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "Error accepting connection:", err)
+				s.ErrorChan <- *NewServerError(ErrorNetwork, "Error accepting connection:", err)
 				continue
 			}
+
 			log.Printf("New connection accepted from %s", conn.RemoteAddr())
+			if len(s.peers) < s.maxPeerLimit {
+				newNode := NewCNode(s)
+				newNode.conn = conn
+				newNode.IsInBound = true
 
-			newNode := NewCNode(s)
-			newNode.conn = conn
+				s.peers = append(s.peers, &newNode)
+				log.Printf("New peer added. Total peers: %d", len(s.peers))
 
-			s.peers = append(s.peers, &newNode)
-			log.Printf("New peer added. Total peers: %d", len(s.peers))
+				go newNode.write()
+				go newNode.handler()
 
-			go newNode.write()
-			go newNode.handler()
+				go newNode.PingHandler(uint8(s.PingingDuration))
+				go s.SendRetryHandler()
+			} else {
+				if evited, evictionError := s.AttemptToEvictConnection(); evited && evictionError != nil {
+					newNode := NewCNode(s)
+					newNode.conn = conn
+					newNode.IsInBound = true
+
+					s.peers = append(s.peers, &newNode)
+					log.Printf("New peer added. Total peers: %d", len(s.peers))
+
+					go newNode.write()
+					go newNode.handler()
+
+					go s.SendRetryHandler()
+				} else if evictionError != nil {
+					s.ErrorChan <- *NewServerError(ErrorNetwork, "Error accepting connection:", evictionError)
+				}
+			}
+
 		}
 	}
 }
@@ -390,24 +457,30 @@ func (s *Server) Close() {
 		peer.Close()
 	}
 }
+
 func (s *Server) Dial(addr string) bool {
 	log.Printf("Attempting to dial %s", addr)
 	conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
 	if err != nil {
 		message := fmt.Sprintf("error dialing %s: %v", addr, err)
-		s.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, message, err)
+		s.ErrorChan <- *NewServerError(ErrorNetwork, message, err)
 		return false
 	}
 	log.Printf("Successfully connected to %s", addr)
 
 	newCNode := NewCNode(s)
+
 	newCNode.conn = conn
 
 	go newCNode.write()
 
 	go newCNode.handler()
-	newCNode.SendVersionMessage()
 
+	go newCNode.SendVersionMessage()
+
+	go newCNode.PingHandler(uint8(s.PingingDuration))
+
+	newCNode.IsInBound = false
 	s.peers = append(s.peers, &newCNode)
 
 	log.Printf("New outgoing peer added. Total peers: %d", len(s.peers))
@@ -430,10 +503,10 @@ func dataByteLen(data []byte) uint16 {
 }
 
 func encodeMessage(Message Message) []byte {
-	totalLength := CMD_BYTE + Message.Length + VERSION_BYTE + LENGTH_BYTES
+	totalLength := VERSION_BYTE + CMD_BYTE + LENGTH_BYTES + Message.Length
 	buffer := make([]byte, totalLength)
 	buffer[0] = Message.Version
-	buffer[1] = Message.Cammand // Make sure this is correct
+	buffer[1] = Message.Cammand
 	binary.BigEndian.PutUint16(buffer[2:4], Message.Length)
 	copy(buffer[4:], Message.Data)
 	fmt.Printf("Encoded Command: %d\n", Message.Cammand)
@@ -462,6 +535,47 @@ func decodeMessage(reader io.Reader) (Message, error) {
 	fmt.Printf("Decoded Command: %d\n", msg.Cammand)
 	return msg, nil
 }
+func (s *Server) AttemptToEvictConnection() (bool, error) {
+	var totalLatency time.Duration
+	var inboundPeers int
+
+	for _, peer := range s.peers {
+		if peer.IsInBound {
+			totalLatency += peer.Latency
+			inboundPeers++
+		}
+	}
+
+	if inboundPeers == 0 {
+		return false, nil
+	}
+
+	avg := totalLatency / time.Duration(inboundPeers)
+	fmt.Println("Average Latency:", avg)
+
+	var sumOfSquaredDifferences float64
+	for _, peer := range s.peers {
+		if peer.IsInBound {
+			latencyDiff := float64(peer.Latency - avg)
+			sumOfSquaredDifferences += latencyDiff * latencyDiff
+		}
+	}
+
+	variance := sumOfSquaredDifferences / float64(inboundPeers)
+	stdDeviation := time.Duration(math.Sqrt(variance))
+	fmt.Println("Standard Deviation:", stdDeviation)
+
+	evictionThreshold := avg + stdDeviation
+	fmt.Println("Eviction Threshold:", evictionThreshold)
+
+	var PeersUnderEvictionThreshold []*CNode
+	for _, peer := range s.peers {
+		if peer.IsInBound && peer.Latency < evictionThreshold {
+			PeersUnderEvictionThreshold = append(PeersUnderEvictionThreshold, peer)
+		}
+	}
+	return len(PeersUnderEvictionThreshold) != len(s.peers), nil
+}
 
 func (cn *CNode) SendVerack(height int) error {
 	log.Printf("Sending Version Acknowledgement to %s", cn.conn.RemoteAddr())
@@ -471,17 +585,17 @@ func (cn *CNode) SendVerack(height int) error {
 	encodedBuff := encodeMessage(Verack)
 	if _, err := cn.conn.Write(encodedBuff); err != nil {
 		message := fmt.Sprintf("error occured sending Verack Message: Err:%v", err)
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, message, err)
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, message, err)
 		return fmt.Errorf("error occured sending Verack Message: Err:%v", err)
 	}
 	if err := cn.SendVersionMessage(); err != nil {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "Error Sending VersionMessage", err)
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Sending VersionMessage", err)
 	}
 	curHeight, err := cn.server.DBMan.GetBlockHeight()
 	if err != nil {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorDatabase, "Error getting block height from db", err)
+		cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error getting block height from db", err)
 	}
-	fmt.Printf("My HEIGHT %d", curHeight)
+	fmt.Printf("MainServer Height : %d\n", curHeight)
 
 	if curHeight < height {
 
@@ -492,12 +606,13 @@ func (cn *CNode) SendVerack(height int) error {
 
 	return nil
 }
+
 func (cn *CNode) RequestBlocks() {
 	message := NewMessage()
 
 	hash, err := cn.server.DBMan.GetPrevHash()
 	if err != nil {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorDatabase, "Error trying to get Prev Hash from DBMan", err)
+		cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error trying to get Prev Hash from DBMan", err)
 	}
 	length := dataByteLen([]byte(hash))
 	message.Length = length
@@ -516,14 +631,14 @@ func (cn *CNode) SendVersionMessage() error {
 		var buff bytes.Buffer
 		currentBlockHeight, GetHighterr := cn.server.DBMan.GetBlockHeight()
 		if GetHighterr != nil {
-			cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorDatabase, "Error getting Block Height From DBMan", GetHighterr)
+			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error getting Block Height From DBMan", GetHighterr)
 		}
 		data.StartHeight = int32(currentBlockHeight)
 
 		endr := gob.NewEncoder(&buff)
 		err := endr.Encode(data)
 		if err != nil {
-			cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "error encoding Version Message", err)
+			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "error encoding Version Message", err)
 		}
 
 		version := NewMessage()
@@ -533,7 +648,7 @@ func (cn *CNode) SendVersionMessage() error {
 		encodedbuff := encodeMessage(version)
 		_, err = cn.conn.Write(encodedbuff)
 		if err != nil {
-			cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "error Writing Version Message", err)
+			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "error Writing Version Message", err)
 			return err
 		}
 
@@ -590,13 +705,13 @@ func (cn *CNode) OnGetDataReqTX(hash string) error {
 
 	fmt.Printf("Transaction thats being sent %v", txn)
 	if err != nil {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorDatabase, "error occured trying to get txn from DB", err)
+		cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "error occured trying to get txn from DB", err)
 	}
 
 	encoded, err := cn.Utils.Encode(txn)
 
 	if err != nil {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorInternal, "OnGetDataReqTX error encoding transaction", err)
+		cn.server.ErrorChan <- *NewServerError(ErrorInternal, "OnGetDataReqTX error encoding transaction", err)
 
 	}
 	if len(encoded) == 0 {
@@ -633,7 +748,7 @@ func (cn *CNode) handler() {
 		}
 		if err != nil {
 			message := fmt.Sprintf("error Decoding Message From Peer %v", cn.conn.RemoteAddr())
-			cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, message, err)
+			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, message, err)
 		}
 
 		cn.Addr = cn.conn.RemoteAddr()
@@ -646,7 +761,7 @@ func (cn *CNode) handler() {
 			if !cn.ExchangedVersion {
 				if err := cn.SendVerack(int(buff.StartHeight)); err != nil {
 					errMessage := fmt.Sprintf("Error sending version ackowledgement message to peer %v", cn.conn.RemoteAddr())
-					cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
+					cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
 				}
 
 			}
@@ -659,7 +774,7 @@ func (cn *CNode) handler() {
 			blocks, err := cn.server.DBMan.FromNToLatestHash(string(msg.Data))
 
 			if err != nil {
-				cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorDatabase, "error occured Trying to get Blocks from Db for Transaport", err)
+				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "error occured Trying to get Blocks from Db for Transaport", err)
 			}
 			for _, hash := range blocks {
 				fmt.Println(string(hash))
@@ -668,7 +783,7 @@ func (cn *CNode) handler() {
 
 			errorEncode := gob.NewEncoder(&buff).Encode(blocks)
 			if errorEncode != nil {
-				cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "Error Encoding Hashes", err)
+				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Encoding Hashes", err)
 			}
 
 			length := dataByteLen(buff.Bytes())
@@ -677,6 +792,7 @@ func (cn *CNode) handler() {
 			msg.Data = buff.Bytes()
 			msg.Length = length
 			encoded := encodeMessage(msg)
+			cn.SentBytes += uint16(length)
 			cn.VSend <- encoded
 		} else if msg.Cammand == byte(INV) {
 			// * check in db if we already have this txn
@@ -684,11 +800,11 @@ func (cn *CNode) handler() {
 			exists, err := cn.server.DBMan.IsInMempool(string(msg.Data))
 
 			if err != nil {
-				cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorDatabase, "error occured Trying to get Blocks from Db for Transaport", err)
+				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "error occured Trying to get Blocks from Db for Transaport", err)
 			}
 			HasAlreadybeenMiner, err := cn.server.DBMan.HasTxnAlreadyBeenMined(string(msg.Data))
 			errMessage := fmt.Sprintf("error checking if the block has already been miner %v", err)
-			cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorDatabase, errMessage, err)
+			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, errMessage, err)
 			if !exists && !HasAlreadybeenMiner {
 				cn.RequestTxn(msg.Data)
 			}
@@ -703,7 +819,6 @@ func (cn *CNode) handler() {
 			// }
 			//	cn.server.StoreInMempoolAndRelay(decodedTxn)
 		} else if msg.Cammand == byte(BLOCK) {
-			// Make sure to register the Block type before using gob
 			if !cn.block {
 				gob.Register(&DBMan.Block{})
 
@@ -713,18 +828,17 @@ func (cn *CNode) handler() {
 
 				err := gob.NewDecoder(&buff).Decode(&block)
 				if err != nil {
-					cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorInternal, "Error decoding Block", err)
+					cn.server.ErrorChan <- *NewServerError(ErrorInternal, "Error decoding Block", err)
 				} else {
 					cn.server.ProcessAndStoreNewMinedBlock(block)
 				}
 
 			}
 		} else if msg.Cammand == byte(HEADERS) {
-			// Decode the incoming hashes
 			var hashes []string
 			decoder := gob.NewDecoder(bytes.NewReader(msg.Data))
 			if err := decoder.Decode(&hashes); err != nil {
-				cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "Error decoding hashes", err)
+				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error decoding hashes", err)
 				continue
 			}
 
@@ -732,7 +846,7 @@ func (cn *CNode) handler() {
 			for _, hash := range hashes {
 				exists, err := cn.server.DBMan.IsBlockAlreadyPresent(hash)
 				if err != nil {
-					cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorDatabase, "Error checking block existence", err)
+					cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error checking block existence", err)
 					continue
 				}
 				if !exists {
@@ -747,7 +861,6 @@ func (cn *CNode) handler() {
 			var hashes []string
 			var buff bytes.Buffer
 			buff.Write(msg.Data)
-			// Create a new decoder from the message data
 			decoder := gob.NewDecoder(&buff)
 			if err := decoder.Decode(&hashes); err != nil {
 				fmt.Printf("failed to decode hashes: %v", err)
@@ -759,36 +872,79 @@ func (cn *CNode) handler() {
 
 			blocks, err := cn.server.DBMan.GetBlocksForGivenHashes(hashes)
 			if err != nil {
-				cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorDatabase, "failed to get blocks: %v", err)
+				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "failed to get blocks: %v", err)
 			}
 
 			errorBlocks := cn.PrepareAndSendBlocks(blocks)
+
+			// Todo maybe the duration will be more error specific
 			if errorBlocks != nil {
-				retryctx := RetryContext{
-					PeerId:   cn.Id,
-					Metadata: blocks,
-				}
-				cn.server.ErrorMan.SetBlocksCtxForRetry(retryctx) //this will do the retry if there is an error when this is doing its thing
+				cn.server.EnqueueRetry(cn.Id, blocks)
+				//this will do the retry if there is an error when this is doing its thing
 				// it will log it no no need to catch anything here but just for fun we'll log
-				cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "Error Preparing Blocks for Transacport", errorBlocks)
+				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Preparing Blocks for Transport", errorBlocks)
 
 			}
 		} else if msg.Cammand == byte(REQUESTEDBLOCKS) {
-
 			var blocks []DBMan.Block
 			var buff bytes.Buffer
 			buff.Write(msg.Data)
 			err := gob.NewDecoder(&buff).Decode(&blocks)
 			if err != nil {
-				cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "Error Decoding Recived Blocks", err)
+				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Decoding Recived Blocks", err)
 			}
+			err = cn.ValidateAndStoreNewRecivedBlocks(blocks)
+			if err != nil {
+				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error Validating Blocks", err)
+			}
+
+		} else if msg.Cammand == byte(PING) {
+			cn.SendPong()
+		} else if msg.Cammand == byte(PONG) {
+			cn.Latency = cn.Timer.ElapsedTime()
+			fmt.Printf("Peer with id %d has a latency of %v\n", cn.Id, cn.Latency)
 		}
 
 	}
 }
+
+func (cn *CNode) ValidateAndStoreNewRecivedBlocks(blocks []DBMan.Block) error {
+	for _, block := range blocks {
+		valid := cn.server.IsBlockValid(&block.Header)
+		if !valid {
+			errorMessage := fmt.Sprintf("recived Block with %s is Invalid rejecting", block.Hash)
+			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, errorMessage, nil)
+		}
+	}
+	for _, block := range blocks {
+		err := cn.server.DBMan.StoreBlock(block)
+		if err != nil {
+			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error Storing Recived Blocks", err)
+		}
+		cn.RecievedBytes += block.BytesLen()
+	}
+
+	return nil
+}
+func (cn *CNode) SendPong() {
+	Pong := NewMessage()
+	Pong.Cammand = byte(PONG)
+	Pong.Data = []byte{}
+	Pong.Length = 0
+	EncodedPong := encodeMessage(Pong)
+	cn.VSend <- EncodedPong
+}
+func (cn *CNode) SendPing() {
+	Ping := NewMessage()
+	Ping.Cammand = byte(PING)
+	Ping.Data = []byte{}
+	Ping.Length = 0
+	EncodedPong := encodeMessage(Ping)
+	cn.VSend <- EncodedPong
+}
 func (cn *CNode) PrepareAndSendBlocks(blocks []DBMan.Block) error {
 	if blocks == nil {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("cannot send nil blocks"))
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("cannot send nil blocks"))
 	}
 
 	var buff bytes.Buffer
@@ -798,7 +954,7 @@ func (cn *CNode) PrepareAndSendBlocks(blocks []DBMan.Block) error {
 
 	encodedData := buff.Bytes()
 	if len(encodedData) == 0 {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "encoded blocks resulted in empty data", nil)
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "encoded blocks resulted in empty data", nil)
 	}
 
 	blocksResponseMessage := NewMessage()
@@ -809,20 +965,22 @@ func (cn *CNode) PrepareAndSendBlocks(blocks []DBMan.Block) error {
 
 	encodedMessage := encodeMessage(blocksResponseMessage)
 	if encodedMessage == nil {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("failed to encode message"))
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("failed to encode message"))
 	}
 
 	if cn.VSend == nil {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "send channel is nil", nil)
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "send channel is nil", nil)
 	}
 	select {
 	case cn.VSend <- encodedMessage:
 		return nil
 	case <-time.After(5 * time.Second):
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("timeout sending blocks to channel"))
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("timeout sending blocks to channel"))
 	}
 	return nil
+
 }
+
 func (cn *CNode) RequestBlocksForGivenHases(hashes []string) {
 
 	var buff bytes.Buffer
@@ -830,7 +988,7 @@ func (cn *CNode) RequestBlocksForGivenHases(hashes []string) {
 	err := gob.NewEncoder(&buff).Encode(hashes)
 
 	if err != nil {
-		cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, "Error Encoding Hashes", err)
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Encoding Hashes", err)
 	}
 	// Create the message
 	newBlockRequestMessage := NewMessage()
@@ -900,7 +1058,7 @@ func (s *Server) BroadCasteBlock(block *DBMan.Block) error {
 	var buff bytes.Buffer
 	err := gob.NewEncoder(&buff).Encode(block)
 	if err != nil {
-		s.ErrorMan.ErrorChan <- *(NewServerError(ErrorNetwork, "Error Encoding Block", err))
+		s.ErrorChan <- *(NewServerError(ErrorNetwork, "Error Encoding Block", err))
 	}
 
 	length := dataByteLen(buff.Bytes())
@@ -927,12 +1085,15 @@ func (cn *CNode) RequestTxn(txn []byte) error {
 	cn.VSend <- encodedGetDataRequest
 	return nil
 }
-func (s *Server) RelayToKnowPeers(transaction DBMan.Transaction) {
+func (s *Server) RelayToKnowPeers(transaction DBMan.Transaction) error {
 	// first send the hash
 	// Todo need more logs this sucks
 	newRelay := NewMessage()
 	data := []byte(transaction.TxnHash)
 	length := dataByteLen(data)
+	if length == 0 {
+		return fmt.Errorf("Error the length of the bytes is 0 cant proccess")
+	}
 	newRelay.Cammand = byte(INV)
 	newRelay.Data = data
 	newRelay.Length = length
@@ -942,7 +1103,7 @@ func (s *Server) RelayToKnowPeers(transaction DBMan.Transaction) {
 			peer.VSend <- encoded
 		}
 	}
-
+	return nil
 }
 
 // ! if added call a relay function and send the txn hashes in mempool and they will check in their db do they already have any of the given txn that maches the hashes provided.
@@ -970,6 +1131,14 @@ func (s *Server) LogPeers() {
 func isTransportOver(data string) bool {
 	return strings.HasSuffix(data, StopCharacter)
 }
+func (cn *CNode) PingHandler(duration uint8) {
+	ticker := time.NewTicker(time.Duration(duration) * time.Minute)
+	for t := range ticker.C {
+		cn.Timer.start = time.Now()
+		cn.SendPing()
+		fmt.Println("Sending Ping  at:", t)
+	}
+}
 
 func (cn *CNode) write() {
 	writer := bufio.NewWriter(cn.conn)
@@ -977,9 +1146,10 @@ func (cn *CNode) write() {
 
 	for {
 		msg, ok := <-cn.VSend
+
 		if !ok {
 			errMessage := fmt.Sprintf("Channel closed for %s, stopping message sending", cn.conn.RemoteAddr()) //* redundant
-			cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, fmt.Errorf("channel closed for %s, stopping message sending", cn.conn.RemoteAddr()))
+			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, fmt.Errorf("channel closed for %s, stopping message sending", cn.conn.RemoteAddr()))
 			return
 		}
 
@@ -987,22 +1157,18 @@ func (cn *CNode) write() {
 		_, err := writer.Write(msg)
 		if err != nil {
 			errMessage := fmt.Sprintf("error writing to : %v", cn.conn.RemoteAddr())
-			cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
+			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
 		}
 
 		err = writer.Flush()
 		if err != nil {
 			errMessage := fmt.Sprintf("Error flushing writer for %s: %v", cn.conn.RemoteAddr(), err)
-			cn.server.ErrorMan.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
+			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
 		}
 		log.Printf("Message flushed to %s", cn.conn.RemoteAddr())
 	}
 }
 func (s *Server) ShutDown() {
-	if s.cancel != nil {
-		fmt.Printf("Closing Down Ctx\n")
-		s.cancel()
-	}
 	if s.listener != nil {
 		fmt.Printf("Closing Down Listners\n")
 		s.listener.Close()
@@ -1013,72 +1179,100 @@ func (s *Server) ShutDown() {
 	}
 
 }
-func InItServer() (Server, error) {
+
+func (s *Server) HandleCallSeeder() {
+	url := `http://localhost:8080/ReadyToServe`
+	jsonData := `{
+		"address": "127.0.0.1:7777",
+		"services": {
+			"doesEverything": true
+		}
+	}`
+	// Todo maybe we can help the seeder too by sening it the addr we know of
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(jsonData)))
+	if err != nil {
+		fmt.Println("Error sending request to seeder:", err)
+		s.Close()
+		log.Fatal("Server stopped due to seeder communication failure")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("Unexpected status code from seeder: %d\n", resp.StatusCode)
+		s.Close()
+		log.Fatal("Server stopped due to unexpected response from seeder")
+	}
+
+	go s.GetActivePeers()
+}
+
+// getActivePeers sends a request to the seeder to get a list of active peers
+func (s *Server) GetActivePeers() {
+	url := `http://localhost:8080/NeedPeers`
+	jsonData := `{
+		"servicesNeeded": {
+			"doesEverything": true
+		},
+		"addr": "127.0.0.1:7777"
+	}`
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(jsonData)))
+	if err != nil {
+		fmt.Println("Error getting active peers:", err)
+		s.Close()
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("Error reading response body:", err)
+		return
+	}
+
+	var addresses []string
+	err = json.Unmarshal(body, &addresses)
+	if err != nil {
+		fmt.Print(err)
+	}
+	s.AddrMan.SaveAddr(addresses)
+	fmt.Printf("Peers : %v\n", addresses)
+
+}
+
+func InItServer() (*Server, error) {
 	log.Println("Starting server application")
 	//! Problem we are intialising db too many times in handler its ugly after test fix it
 	//Todo
-	db, err := DBMan.InitDB("../../testDB")
+	db, err := DBMan.InitDB("../../MainServer.db")
 	if err != nil {
-		return Server{}, fmt.Errorf("error occurred initializing db: %w", err)
+		return &Server{}, fmt.Errorf("error occurred initializing db: %w", err)
 	}
 	//ctx, _ := context.WithCancel(context.Background())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	ErrMan := &ErrorMan{
-		Connman: &Server{},
-		ctx:     ctx,
+	addMan, err := Addrman.GetAddrMan("./Addr.db")
+	if err != nil {
+		return &Server{}, fmt.Errorf("Error Stating AddrMan %v", err)
 	}
 	config := Config{
-		Host:     "127.0.0.1",
-		Port:     "8082",
-		DBMan:    db,
-		ErrorMan: ErrMan,
+		Host:             "127.0.0.1",
+		Port:             "7777",
+		DBMan:            db,
+		Addrman:          addMan,
+		MaxPeerLimit:     20,
+		MaxOutBoundPeers: 8,
+		PingingDuration:  1,
 	}
-
 	server := New(&config)
-	ErrMan.Connman = server
-	server.maxPeerLimit = 20
-	server.ErrorMan = ErrMan
-	server.cancel = cancel
+
 	go func() {
 		server.Run()
 	}()
-	return *server, nil
+
+	return server, nil
 }
 
-// Custom key type for context values to avoid string collisions
-type contextKey string
-
-const retryContextKey contextKey = "RetryCtx"
-
-type ErrorMan struct {
-	ctx               context.Context
-	RetryRequestQueue chan context.Context
-	RetrySendQueue    chan context.Context
-	ErrorChan         chan ServerError
-	Connman           *Server
-}
-
-func NewServerError(errType ErrorType, message string, err error) *ServerError {
-	return &ServerError{
-		Type:    errType,
-		Message: message,
-		Err:     err,
-	}
-}
-func NewErrorMan(ctx context.Context, connMan *Server) *ErrorMan {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return &ErrorMan{
-		ctx:               ctx,
-		RetryRequestQueue: make(chan context.Context, 100),
-		RetrySendQueue:    make(chan context.Context, 100),
-		Connman:           connMan,
-		ErrorChan:         make(chan ServerError, 1000),
-	}
-}
-func (em *ErrorMan) Log(err error) {
+func (em *Server) Log(err error) {
 	serverErr, ok := err.(*ServerError)
 	if !ok {
 		fmt.Println("Error is not of type *ServerError:", err)
@@ -1094,7 +1288,7 @@ func (em *ErrorMan) Log(err error) {
 		fmt.Printf("%s%s%s : %s%v%s\n", Green, prefix, Reset, Blue, serverErr, Reset)
 	case ErrorProtocol:
 		prefix = "Protocol Error"
-		fmt.Printf("%s%s%s : %s%v%s\n", Cyan, prefix, Reset, Yellow, serverErr, Reset)
+		fmt.Printf("%s%s%s : %sFailed to connect%v%s\n", Cyan, prefix, Reset, Yellow, serverErr, Reset)
 	case ErrorInternal:
 		prefix = "Internal Error"
 		fmt.Printf("%s%s%s : %s%v%s\n", Red, prefix, Reset, Magenta, serverErr, Reset)
@@ -1108,74 +1302,68 @@ func (em *ErrorMan) Log(err error) {
 
 }
 func (rc RetryContext) String() string {
-	// Convert to JSON for readable output
 	data, err := json.Marshal(rc)
 	if err != nil {
 		return fmt.Sprintf("PeerId: %d, Metadata: %v", rc.PeerId, rc.Metadata)
 	}
 	return string(data)
 }
+func (s *Server) SendRetryHandler() {
+	s.Wg.Add(1)
+	defer s.Wg.Done()
 
-func (em *ErrorMan) MaybeRetryGetBlocksFromPeers(ctx context.Context) {
 	for {
-		ctx, ok := <-em.RetryRequestQueue
-		if !ok {
-			em.ErrorChan <- *NewServerError(ErrorInternal, "Error Occurred while reading chan", nil)
+		select {
+		case <-s.done:
+			log.Println("Server shutting down, stopping retry handler")
 			return
-		}
 
-		if retryCtx, ok := ctx.Value(retryContextKey).(RetryContext); ok {
-			fmt.Printf("%sRetry Context:%s %s%v%s\n",
-				Yellow,
-				Reset,
-				Green,
-				retryCtx,
-				Reset)
-		} else {
-			fmt.Printf("No retry context found in context\n")
-		}
-	}
-}
+		case retry, ok := <-s.RetrySendQueue:
+			if !ok {
+				log.Println("Retry queue channel closed")
+				s.ErrorChan <- ServerError{
 
-func (em ErrorMan) RetrySendingBlockToPeer(ctx context.Context) {
-	for {
-		ctx, ok := <-em.RetrySendQueue
-		if !ok {
-			em.ErrorChan <- *NewServerError(ErrorInternal, "Error Occurred while reading chan", nil)
-			return
-		}
-
-		if retryCtx, ok := ctx.Value(retryContextKey).(RetryContext); ok {
-			for _, peer := range em.Connman.peers {
-				if peer.Id == retryCtx.PeerId {
-					peer.PrepareAndSendBlocks(retryCtx.Metadata)
+					Message: "Retry queue channel closed",
 				}
+				return
 			}
-			// fmt.Printf("%sRetry Send Context:%s %s%v%s\n",
-			// 	Cyan,
-			// 	Reset,
-			// 	Magenta,
-			// 	retryCtx,
-			// 	Reset)
+			// log.Printf("Processing retry %d/%d for peer %d with metadata: %+v\n",
+			// 	retry.Attempts, retry.MaxRetries, retry.PeerId, retry.Metadata)
 
-		} else {
-			fmt.Printf("No retry context found in context\n")
+			retry.Attempts++
+
+			for _, peer := range s.peers {
+				if peer.Id == retry.PeerId {
+					fmt.Printf("Waiting 10 secs before retrying to resend blocks")
+					time.Sleep(10 * time.Second) // ! this may help with latency
+					peer.PrepareAndSendBlocks(retry.Metadata)
+					break
+				}
+
+			}
 		}
+
 	}
 }
 
-func (em *ErrorMan) SetGetBlockErrorRetryCtx(ctx context.Context, retCtx RetryContext) {
-	newCtx := context.WithValue(ctx, retryContextKey, retCtx)
-	em.RetryRequestQueue <- newCtx
-}
-func (em *ErrorMan) SetBlocksCtxForRetry(retCtx RetryContext) {
-	newCtx := context.WithValue(em.ctx, retryContextKey, retCtx)
-	em.RetryRequestQueue <- newCtx
+func NewServerError(errType ErrorType, message string, err error) *ServerError {
+	return &ServerError{
+		Type:    errType,
+		Message: message,
+		Err:     err,
+	}
 }
 
-func (em ErrorMan) HandleErrors() {
-	for {
-		err := <-em.ErrorChan
-		em.Log(&err)
+func (s *Server) EnqueueRetry(peerId int, metadata []DBMan.Block) error {
+	select {
+	case s.RetrySendQueue <- RetryContext{
+		PeerId:     peerId,
+		Metadata:   metadata,
+		Attempts:   0,
+		MaxRetries: 3,
+	}:
+		return nil
+	default:
+		return fmt.Errorf("retry queue is full")
 	}
 }

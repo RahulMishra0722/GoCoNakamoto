@@ -127,6 +127,12 @@ func (rpc *RpcServer) SubmitBlock(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "error unmarshaling json", http.StatusBadRequest)
 	}
 	ok, err := rpc.Connman.ProcessAndStoreNewMinedBlock(reqBlock)
+
+	for _, txn := range reqBlock.Transactions {
+		for _, opt := range txn.Outputs {
+			fmt.Printf("Value %v", opt.Output.Value)
+		}
+	}
 	if err != nil {
 		fmt.Print(err)
 		http.Error(w, "Error storing block %w", http.StatusInternalServerError)

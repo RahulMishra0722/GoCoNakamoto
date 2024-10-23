@@ -1,5 +1,6 @@
 package main
 
+//Todo dont let the txn get in from the wallet if its sig is invalid
 import (
 	"bytes"
 	"crypto/sha256"
@@ -45,7 +46,7 @@ func doubleSHA256(data []byte) string {
 
 // }
 
-func (m *Miner) CreateCoinbaseTransaction() (DBMan.Transaction, error) {
+func (m *Miner) CreateCoinbaseTransaction(totalFee float64) (DBMan.Transaction, error) {
 	_, publicKey, err := GenerateKeys()
 	if err != nil {
 		fmt.Printf("Error Generating Keys CoinBase %s", err)
@@ -69,11 +70,10 @@ func (m *Miner) CreateCoinbaseTransaction() (DBMan.Transaction, error) {
 	}
 
 	output := DBMan.TxOutput{
-		Value:        Subsidy,
+		Value:        Subsidy + totalFee,
 		ScriptPubKey: publicKey,
 	}
 	outPoint := DBMan.OutPoint{
-
 		Hash:  coinBaseTxn.CalculateHash(),
 		Index: 0,
 	}
@@ -278,6 +278,7 @@ type Template struct {
 func (m *Miner) NewBlock(merkelRoot string) (*DBMan.Block, error) {
 	fmt.Println("Mining starts")
 	var successFullyMinedTransactions []DBMan.Transaction
+	var totalFee float64
 	template, err := m.casheMan.GetBlockTemplate()
 	if err != nil {
 		fmt.Println(err)
@@ -352,7 +353,7 @@ func (m *Miner) NewBlock(merkelRoot string) (*DBMan.Block, error) {
 				}
 
 				outputSenderUtxo.Id = doubleSHA256(SenderUtxoId.Bytes())
-
+				totalFee += txn.Fee
 				txn.Outputs = append(txn.Outputs, outputRecieverUtxo)
 				txn.Outputs = append(txn.Outputs, outputSenderUtxo)
 
@@ -378,6 +379,7 @@ func (m *Miner) NewBlock(merkelRoot string) (*DBMan.Block, error) {
 				}
 
 				//!m.DBman.StoreUTXO(ReciverOutput.ScriptPubKey, outputRecieverUtxo)
+				totalFee += txn.Fee
 				txn.Outputs = append(txn.Outputs, outputRecieverUtxo)
 				successFullyMinedTransactions = append(successFullyMinedTransactions, txn)
 
@@ -390,7 +392,7 @@ func (m *Miner) NewBlock(merkelRoot string) (*DBMan.Block, error) {
 
 	}
 
-	cbaseTxn, err := m.CreateCoinbaseTransaction() // push it at the front of the outputs array in block transaction
+	cbaseTxn, err := m.CreateCoinbaseTransaction(totalFee) // push it at the front of the outputs array in block transaction
 
 	if err != nil {
 		fmt.Print(err)
@@ -404,6 +406,7 @@ func (m *Miner) NewBlock(merkelRoot string) (*DBMan.Block, error) {
 		Bits:          template.Bits,
 		Nonce:         0,
 	}
+
 	Hash := m.ProofOfWork(&blockHeader)
 	cbaseTxn.TxnHash = cbaseTxn.CalculateHash() // Update txn hash before adding to the block
 	cbaseTxn.BlockHash = Hash
@@ -551,6 +554,13 @@ func main() {
 	miner.casheMan.SetBlockTemplate(blockTemplate)
 
 	block, err := miner.MineBlock()
+	for i := 0; i < 1; i++ {
+		for _, txn := range block.Transactions {
+			for _, opt := range txn.Outputs {
+				fmt.Printf("Utxo value %f", opt.Output.Value)
+			}
+		}
+	}
 	urlSend := "http://localhost:8087/SubmitBlock"
 
 	sumbitError := miner.SubmitBlock(urlSend, *block)

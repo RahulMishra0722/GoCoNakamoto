@@ -510,6 +510,7 @@ func (dm *DBman) VerifyTransaction(ctx context.Context, transaction Transaction)
 
 			log.Printf("VerifyTransaction: Total UTXO value: %f, Transaction amount: %f", total, transaction.Amount)
 			if total < transaction.Amount {
+
 				log.Printf("VerifyTransaction: Insufficient balance for transaction %s", transaction.TxnHash)
 				return fmt.Errorf("insufficient balance, transaction rejected")
 			}

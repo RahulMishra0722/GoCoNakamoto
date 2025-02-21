@@ -252,6 +252,8 @@ type Server struct {
 	AddrMan          *Addrman.Addrman
 	maxOutBoundPeers int
 	PingingDuration  int
+	Ctx              context.Context
+	Cancel           context.CancelFunc
 }
 type VersionMessage struct {
 	Version     float64
@@ -377,6 +379,8 @@ type Config struct {
 	MaxOutBoundPeers int
 	Addrman          *Addrman.Addrman
 	PingingDuration  int
+	Ctx              context.Context
+	Cancel           context.CancelFunc
 }
 
 // New initializes a new server with the given configuration
@@ -393,6 +397,8 @@ func New(config *Config) *Server {
 		maxPeerLimit:     config.MaxPeerLimit,
 		maxOutBoundPeers: config.MaxOutBoundPeers,
 		PingingDuration:  config.PingingDuration,
+		Ctx:              config.Ctx,
+		Cancel:           config.Cancel,
 	}
 }
 
@@ -819,12 +825,16 @@ func (cn *CNode) handler() {
 			go cn.OnGetDataReqTX(string(msg.Data))
 		} else if msg.Cammand == byte(TX) {
 
-			// var txn DBMan.Transaction
-			// decodedTxn, err := cn.Utils.Decode(msg.Data, &txn)
-			// if err != nil {
-			// 	cn.server.handleError(NewServerError(ErrorProtocol, "error decoding message from peer", err))
-			// }
-			//	cn.server.StoreInMempoolAndRelay(decodedTxn)
+			var txn DBMan.Transaction
+			decodedTxn, err := cn.Utils.Decode(msg.Data, &txn)
+			if err != nil {
+				cn.server.ErrorChan <- *NewServerError(ErrorProtocol, "error decoding message from peer", err)
+			}
+			e, _ := cn.server.StoreInMempoolAndRelay(cn.server.Ctx, decodedTxn)
+			if e != nil {
+				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error Storing Txn In Mempool", e)
+			}
+
 		} else if msg.Cammand == byte(BLOCK) {
 			if !cn.block {
 				gob.Register(&DBMan.Block{})
@@ -1261,6 +1271,7 @@ func InItServer() (*Server, error) {
 	if err != nil {
 		return &Server{}, fmt.Errorf("Error Stating AddrMan %v", err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	config := Config{
 		Host:             "127.0.0.1",
 		Port:             "7777",
@@ -1269,6 +1280,8 @@ func InItServer() (*Server, error) {
 		MaxPeerLimit:     20,
 		MaxOutBoundPeers: 8,
 		PingingDuration:  1,
+		Ctx:              ctx,
+		Cancel:           cancel,
 	}
 	server := New(&config)
 

@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/binary"
+	"math/big"
 	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
@@ -168,33 +169,6 @@ func SerializeUtxo(utxo Utxo) ([]byte, error) {
 	return json.Marshal(utxo)
 }
 func GetDB(path string) (*DBman, error) {
-	// if instance == nil {
-	// 	dbMutex.Lock()
-	// 	defer dbMutex.Unlock()
-
-	// 	if instance == nil {
-	// 		var err error
-	// 		once.Do(func() {
-	// 			db, openErr := bbolt.Open(path, 0666, nil)
-	// 			if openErr != nil {
-	// 				err = fmt.Errorf("failed to open database: %w", openErr)
-	// 				return
-	// 			}
-	// 			instance = &DBman{
-	// 				db: db,
-	// 			}
-	// 		})
-	// 		if err != nil {
-	// 			return nil, err
-	// 		}
-	// 	}
-	// }
-
-	// if instance == nil || instance.db == nil {
-	// 	return nil, fmt.Errorf("database is not initialized properly")
-	// }
-
-	// return instance, nil
 	db, openErr := bbolt.Open(path, 0666, nil)
 	if openErr != nil {
 		err := fmt.Errorf("failed to open database: %w", openErr)
@@ -304,13 +278,20 @@ func CalculateMerkleRoot(transactions []Transaction) string {
 
 	return hex.EncodeToString(hashes[0])
 }
+// PrivKeyToHex renders a private key scalar as a fixed-width hex string.
 func PrivKeyToHex(privKey *ecdsa.PrivateKey) string {
 	return fmt.Sprintf("%064x", privKey.D)
 }
+
+// PubKeyToHex encodes raw public key bytes as hex.
 func PubKeyToHex(pubKeyBytes []byte) string {
 	return hex.EncodeToString(pubKeyBytes)
 }
 
+// CalculateBlockHash is the CANONICAL block hash: double SHA-256 over the
+// serialized header, matching what ProofOfWork and block validation use.
+// All hashing lives here in DBMan — the package that owns the types being
+// hashed — so miner and validator can never drift.
 func CalculateBlockHash(header BlockHeader) string {
 	headerBytes := []byte(fmt.Sprintf("%f%s%s%d%d%d",
 		header.Version,
@@ -322,7 +303,19 @@ func CalculateBlockHash(header BlockHeader) string {
 	))
 
 	hash := sha256.Sum256(headerBytes)
-	return hex.EncodeToString(hash[:])
+	finalHash := sha256.Sum256(hash[:])
+	return hex.EncodeToString(finalHash[:])
+}
+
+// CompactToBig converts a compact difficulty representation (e.g.
+// 0x1e00ffff) into the full big.Int target. Difficulty is consensus data,
+// so it lives here next to the hash functions that use it.
+func CompactToBig(compact uint32) *big.Int {
+	exponent := uint(compact >> 24)
+	coefficient := compact & 0x007fffff
+	target := new(big.Int).SetUint64(uint64(coefficient))
+	target.Lsh(target, 8*(exponent-3))
+	return target
 }
 
 func CalculateTransactionHash(tx Transaction) string {
@@ -390,43 +383,10 @@ func (b *Block) BytesLen() uint32 {
 	gob.NewEncoder(&buff).Encode(b)
 	return uint32(buff.Len())
 }
-func (tx *Transaction) CalculateHash() string {
 
-	data := tx.BlockHash + tx.TxnHash + string(tx.Sender) + string(tx.Receiver) + tx.Signature
-
-	// Serialize Amount (satoshis, int64)
-	amountBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(amountBytes, uint64(tx.Amount))
-	data += string(amountBytes)
-
-	// Serialize LockTime
-	lockTimeBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(lockTimeBytes, tx.LockTime)
-	data += string(lockTimeBytes)
-
-	// Serialize IsCoinbase
-	isCoinbaseByte := []byte{0}
-	if tx.IsCoinbase {
-		isCoinbaseByte[0] = 1
-	}
-	data += string(isCoinbaseByte)
-
-	// Serialize Height
-	heightBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(heightBytes, tx.Height)
-	data += string(heightBytes)
-
-	// Serialize Subsidy (satoshis, int64)
-	subsidyBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(subsidyBytes, uint64(tx.Subsidy))
-	data += string(subsidyBytes)
-
-	// Create a SHA-256 hash of the serialized data
-	hash := sha256.Sum256([]byte(data))
-
-	// Return the hash as a hexadecimal string
-	return hex.EncodeToString(hash[:])
-}
+// Transaction.CalculateHash was deleted: it hashed its own TxnHash and
+// BlockHash fields (a hash that covers the field it produces). The one
+// caller now uses CalculateTransactionHash.
 
 func (dm *DBman) DeleteMempoolTransaction(hash string) (bool, error) {
 	var deleted bool
@@ -776,13 +736,6 @@ func (dm *DBman) LogAllTheBlocks() error {
 						fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
 					}
 				}
-				fmt.Println("  Outputs:")
-				for _, otpt := range txn.Outputs {
-					fmt.Printf("    Output ID:              %v\n", otpt.Id)
-					fmt.Printf("    Previous Output Hash:   %v\n", otpt.PreviousOutput.Hash)
-					fmt.Printf("    Output Value:           %v\n", otpt.Output.Value)
-					fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
-				}
 				fmt.Println("  -----------------------------")
 			}
 
@@ -997,49 +950,6 @@ func (dm *DBman) StoreTransaction(hash string, txn Transaction) error {
 	}
 	return nil
 }
-func (dm *DBman) TransactionLogger() error {
-	err := dm.db.View(func(tx *bbolt.Tx) error {
-		bucketName := []byte("Transactions")
-		bucket := tx.Bucket(bucketName)
-		if bucket == nil {
-			return fmt.Errorf("bucket with name %s does not yet exist", bucketName)
-		}
-		cursor := bucket.Cursor()
-
-		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			var txn Transaction
-			var buff bytes.Buffer
-			buff.Write(v)
-			decoder := gob.NewDecoder(&buff)
-			decoder.Decode(&txn)
-			fmt.Printf("  Txn Hash:      %v\n", txn.TxnHash)
-			fmt.Printf("  Block Hash:    %v\n", txn.BlockHash)
-			fmt.Printf("  Is Coinbase:   %v\n", txn.IsCoinbase)
-			fmt.Printf("  Miner Subsidy: %v\n", txn.Subsidy)
-			if txn.IsCoinbase {
-				fmt.Print("No Inputs Since its a CoinBase Txn\n")
-			} else {
-				fmt.Println("  Outputs:")
-				for _, otpt := range txn.Outputs {
-					fmt.Printf("    Output ID:              %v\n", otpt.Id)
-					fmt.Printf("    Previous Output Hash:   %v\n", otpt.PreviousOutput.Hash)
-					fmt.Printf("    Output Value:           %v\n", otpt.Output.Value)
-					fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
-				}
-			}
-			fmt.Println("  Outputs:")
-			for _, otpt := range txn.Outputs {
-				fmt.Printf("    Output ID:              %v\n", otpt.Id)
-				fmt.Printf("    Previous Output Hash:   %v\n", otpt.PreviousOutput.Hash)
-				fmt.Printf("    Output Value:           %v\n", otpt.Output.Value)
-				fmt.Printf("    Output Script PubKey:   %v\n", otpt.Output.ScriptPubKey)
-			}
-			fmt.Println("  -----------------------------")
-		}
-		return nil
-	})
-	return err
-}
 
 func (dm *DBman) GetTxnFromMempool(hash string) (Transaction, error) {
 	var Transact Transaction
@@ -1086,103 +996,6 @@ func (dm *DBman) HasTxnAlreadyBeenMined(hash string) (bool, error) {
 	return exists, nil
 }
 
-// Todo a function to create all the buckets on start so we dont run into dumb issues
-func (dm *DBman) StoreBlocks(blocks *[]Block) (bool, error) {
-
-	dm.rwMu.Lock()
-	defer dm.rwMu.Unlock()
-
-	err := dm.db.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte("Blocks"))
-		if bucket == nil {
-			return fmt.Errorf("bucket 'Blocks' does not exist")
-		}
-
-		for i, block := range *blocks {
-			var buff bytes.Buffer
-			err := gob.NewEncoder(&buff).Encode(block)
-			if err != nil {
-				return fmt.Errorf("error encoding block %d: %v", i, err)
-			}
-
-			err = bucket.Put([]byte(block.Hash), buff.Bytes())
-			if err != nil {
-				return fmt.Errorf("error putting block %d into bucket: %v", i, err)
-			}
-			prevHashBucket := tx.Bucket([]byte("prev_hash"))
-			err = prevHashBucket.Put([]byte("Prev"), []byte(block.Hash))
-			if err != nil {
-				return fmt.Errorf("error setting BlockPrev hash")
-			}
-		}
-		return nil
-	})
-
-	if err != nil {
-		fmt.Println("Error storing blocks, attempting to store in temp bucket:", err)
-		// Store in temp bucket for later retry
-		err = dm.db.Update(func(tx *bbolt.Tx) error {
-			bucket, err := tx.CreateBucketIfNotExists([]byte("tempBlocksStorage"))
-			if err != nil {
-				return fmt.Errorf("error creating temp bucket: %v", err)
-			}
-			//! check if the error was on our side if so store the blocks in a
-			//!temp bucket and after error checks retry also ask who has the
-			//!longest block given all the peers we know of rn if the error was
-			//! inside block / something was wrong init clear temp bucket can move on with our lives
-			// Use a unique key for storing the block set
-			var buff bytes.Buffer
-			if err = gob.NewEncoder(&buff).Encode(blocks); err != nil {
-				return fmt.Errorf("error encoding RecoveryBlocks: %v", err)
-			}
-			err = bucket.Put([]byte("temp"), buff.Bytes())
-			if err != nil {
-				return fmt.Errorf("error storing recovery blocks: %v", err)
-			}
-
-			return nil
-		})
-		if err != nil {
-			return false, fmt.Errorf("failed to store recovery blocks: %v", err)
-		}
-		return false, nil
-	}
-
-	return true, nil
-}
-
-func (dm *DBman) GetTransactions(hash string) (interface{}, error) {
-	dm.rwMu.RLock()
-	defer dm.rwMu.RUnlock()
-
-	var deserializedTxn interface{}
-	err := dm.db.View(func(tx *bbolt.Tx) error {
-		bucketName := []byte("Transactions")
-		bucket := tx.Bucket(bucketName)
-		if bucket == nil {
-			return fmt.Errorf("bucket 'Transactions' does not exist")
-		}
-
-		txnData := bucket.Get([]byte(hash))
-		if txnData == nil {
-			return fmt.Errorf("transaction with hash %s does not exist", hash)
-		}
-
-		err := gob.NewDecoder(bytes.NewBuffer(txnData)).Decode(&deserializedTxn)
-		if err != nil {
-			return fmt.Errorf("error deserializing transaction: %w", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return Transaction{}, fmt.Errorf("error getting transaction: %w", err)
-	}
-
-	fmt.Printf("Transaction being sent to peer from db: %v\n", deserializedTxn)
-	return deserializedTxn, nil
-}
 func (dm *DBman) StoreUTXO(hash string, utxo Utxo) error {
 	dm.rwMu.Lock()
 	defer dm.rwMu.Unlock()
@@ -1370,61 +1183,4 @@ func (dm *DBman) GetBalance(pubkey string) (int64, []Utxo, error) {
 
 	return balance, utxos, nil
 }
-func (dm *DBman) ListAllUTXOs() error {
-	return dm.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte("MemPoolTransactions"))
-		if bucket == nil {
-			return fmt.Errorf("UTXO bucket not found")
-		}
 
-		cursor := bucket.Cursor()
-		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			utxo, err := DeserializeMempool(v)
-			if err != nil {
-				return fmt.Errorf("failed to deserialize UTXO: %v", err)
-			}
-			fmt.Printf("Key: %x\n", k)
-			fmt.Printf("ScriptPubKey: %v", utxo)
-
-		}
-		return nil
-	})
-}
-
-// func (dm *DBman) SetFailedToSendBlocks(peerId int, blocks Blocks) error {
-// 	return dm.db.Update(func(tx *bbolt.Tx) error {
-// 		failedBlocks := tx.Bucket([]byte("TransportFailedBlocks"))
-// 		if failedBlocks != nil {
-// 			return fmt.Errorf("error Bucket TransportFailedBlocks Does not exist DB it issue")
-// 		}
-// 		blocks := blocks.Serialize()
-
-// 		err := failedBlocks.Put([]byte(string(peerId)), blocks)
-
-// 		return err
-// 	})
-// }
-// func (dm *DBman) GetFailedToSendBlocks(peerId int) ([]Block, error) {
-// 	var blocks []Block
-// 	var err error
-// 	dm.db.View(func(tx *bbolt.Tx) error {
-// 		failedBlocks := tx.Bucket([]byte("TransportFailedBlocks"))
-// 		if failedBlocks != nil {
-// 			return fmt.Errorf("error Bucket TransportFailedBlocks Does not exist DB it issue")
-// 		}
-
-// 		data := failedBlocks.Get([]byte(string(peerId)))
-// 		if data != nil {
-// 			return fmt.Errorf("blocks for peer doesnt exists")
-// 		}
-// 		blocks, err = Deserialize(data)
-// 		if err != nil {
-// 			return fmt.Errorf("error Deseralising Blocks From Failed to send blocks storage")
-// 		}
-// 		return err
-// 	})
-// 	if err != nil {
-// 		return []Block{}, fmt.Errorf("error occured trying to get failed to transaport blocks from db for peer %d", peerId)
-// 	}
-// 	return blocks, err
-// }

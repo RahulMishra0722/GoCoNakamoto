@@ -18,7 +18,6 @@ import (
 
 	"github.com/RahulMishra0722/GC/DBMan"
 	MinerCacheMan "github.com/RahulMishra0722/GC/MinerCasheMan"
-	"github.com/RahulMishra0722/GC/Utils"
 
 	"github.com/btcsuite/btcd/btcec"
 	"go.uber.org/zap/buffer"
@@ -75,7 +74,7 @@ func (m *Miner) CreateCoinbaseTransaction(totalFee int64) (DBMan.Transaction, er
 		ScriptPubKey: publicKey,
 	}
 	outPoint := DBMan.OutPoint{
-		Hash:  coinBaseTxn.CalculateHash(),
+		Hash:  DBMan.CalculateTransactionHash(coinBaseTxn),
 		Index: 0,
 	}
 
@@ -97,63 +96,6 @@ func (m *Miner) CreateCoinbaseTransaction(totalFee int64) (DBMan.Transaction, er
 	coinBaseTxn.Outputs = append(coinBaseTxn.Outputs, utxo)
 	return coinBaseTxn, nil
 }
-func CompactToBig(compact uint32) *big.Int {
-	// !Mental Note
-	// The current difficulty is represented in compact form as 0x1c1fffff.
-	// In binary, this is: 0001 1100 0001 1111 1111 1111 1111 1111
-	// The first 8 bits represent the exponent, and the last 24 bits represent the coefficient.
-
-	// Extract the exponent by right-shifting the compact value by 24 bits.
-	// This gives us the first byte (0x1c) as the exponent.
-	exponent := uint(compact >> 24)
-
-	// Extract the coefficient using a bitwise AND operation with 0x007fffff.
-	// This masks out the upper 8 bits, leaving only the lower 24 bits (the coefficient).
-	coefficient := compact & 0x007fffff // we use this to zero out the exponent and extract coefficient
-	// In binary, 0x007fffff is: 0000 0111 1111 1111 1111 1111 1111
-	// Performing the AND operation results in:
-	// 0001 1100 0001 1111 1111 1111 1111 1111 (compact)
-	// AND
-	// 0000 0000 0111 1111 1111 1111 1111 1111 (mask)
-	// --------------------------------------------
-	// Resulting in:
-	// 0 0 0 0    0 0 0 0   0 0 0 1   1 1 1 1  1 1 1 1   1 1 1 1   1 1 1 1  1 1 1 1
-	//   0          1          1         f        f         f         f        f
-	// This binary value corresponds to the coefficient 0x001fffff or 0x1fffff in hexadecimal.
-
-	// Create a new big.Int and set its value to the coefficient.
-	target := new(big.Int).SetUint64(uint64(coefficient))
-	// This converts the coefficient (e.g., 2097151 for 0x1fffff) into a big integer.
-
-	// Shift the target to the left by (8 * (exponent - 3)) bits.
-	// This is equivalent to multiplying the target by 2 raised to the power of (8 * (exponent - 3)).
-	// The exponent is 28, so we calculate:
-	// 8 * (28 - 3) = 8 * 25 = 200
-	// Thus, we are effectively multiplying the target by 2^200.
-	target.Lsh(target, 8*(exponent-3))
-
-	// The result is a big integer that represents the mining difficulty target.
-	// A higher value for the target indicates a lower difficulty in mining,
-	// while a smaller value (like this one, due to the left shift) indicates a high difficulty.
-
-	return target
-}
-
-func HashBlock(header DBMan.BlockHeader) string {
-	headerData := fmt.Sprintf("%f%s%s%d%d%d",
-		header.Version,
-		header.PrevBlockHash,
-		header.MerkleRoot,
-		header.Timestamp,
-		header.Bits,
-		header.Nonce,
-	)
-	// Double SHA-256 hash
-	hash := sha256.Sum256([]byte(headerData))
-	finalHash := sha256.Sum256(hash[:])
-
-	return hex.EncodeToString(finalHash[:])
-}
 
 // CalculateMerkleRoot was deleted: the miner now uses
 // DBMan.CalculateMerkleRoot — the exact function the validating node
@@ -169,8 +111,8 @@ func GenerateKeys() (string, string, error) {
 
 	ecdsaPrivKey := privateKey.ToECDSA()
 	compressedPubKey := privateKey.PubKey().SerializeCompressed()
-	priv := Utils.PrivKeyToHex(ecdsaPrivKey)
-	pub := Utils.PubKeyToHex(compressedPubKey)
+	priv := DBMan.PrivKeyToHex(ecdsaPrivKey)
+	pub := DBMan.PubKeyToHex(compressedPubKey)
 	fmt.Print("\n Miner Reward Public key: ", pub, "\n")
 	fmt.Print("\n Miner Reward Private key: ", priv, "\n")
 	fmt.Print("\n")
@@ -178,12 +120,12 @@ func GenerateKeys() (string, string, error) {
 }
 func (m *Miner) ProofOfWork(block *DBMan.BlockHeader) string {
 
-	target := CompactToBig(uint32(block.Bits))
+	target := DBMan.CompactToBig(uint32(block.Bits))
 	fmt.Printf("Target: %s\n", target.Text(16))
 	fmt.Println("Mining is in Progress")
 	for {
 
-		hash := HashBlock(*block)
+		hash := DBMan.CalculateBlockHash(*block)
 
 		hashInt := new(big.Int)
 		hashInt.SetString(hash, 16)

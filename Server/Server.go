@@ -4,10 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,7 +15,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -88,48 +85,6 @@ const MaxMessageSize = 32 * 1024 * 1024 // 32MB
  having a bigger number will increase our chances of getting a valid block hash
  In other words, this is a **low difficulty**, meaning mining will be relatively **easy**.
 */
-func CompactToBig(compact uint32) *big.Int {
-	// !Mental Note
-	// The current difficulty is represented in compact form as 0x1c1fffff.
-	// In binary, this is: 0001 1100 0001 1111 1111 1111 1111 1111
-	// The first 8 bits represent the exponent, and the last 24 bits represent the coefficient.
-
-	// Extract the exponent by right-shifting the compact value by 24 bits.
-	// This gives us the first byte (0x1c) as the exponent.
-	exponent := uint(compact >> 24)
-
-	// Extract the coefficient using a bitwise AND operation with 0x007fffff.
-	// This masks out the upper 8 bits, leaving only the lower 24 bits (the coefficient).
-	coefficient := compact & 0x007fffff // we use this to zero out the exponent and extract coefficient
-	// In binary, 0x007fffff is: 0000 0111 1111 1111 1111 1111 1111
-	// Performing the AND operation results in:
-	// 0001 1100 0001 1111 1111 1111 1111 1111 (compact)
-	// AND
-	// 0000 0000 0111 1111 1111 1111 1111 1111 (mask)
-	// --------------------------------------------
-	// Resulting in:
-	// 0 0 0 0    0 0 0 0   0 0 0 1   1 1 1 1  1 1 1 1   1 1 1 1   1 1 1 1  1 1 1 1
-	//   0          1          1         f        f         f         f        f
-	// This binary value corresponds to the coefficient 0x001fffff or 0x1fffff in hexadecimal.
-
-	// Create a new big.Int and set its value to the coefficient.
-	target := new(big.Int).SetUint64(uint64(coefficient))
-	// This converts the coefficient (e.g., 2097151 for 0x1fffff) into a big integer.
-
-	// Shift the target to the left by (8 * (exponent - 3)) bits.
-	// This is equivalent to multiplying the target by 2 raised to the power of (8 * (exponent - 3)).
-	// The exponent is 28, so we calculate:
-	// 8 * (28 - 3) = 8 * 25 = 200
-	// Thus, we are effectively multiplying the target by 2^200.
-	target.Lsh(target, 8*(exponent-3))
-
-	// The result is a big integer that represents the mining difficulty target.
-	// A higher value for the target indicates a lower difficulty in mining,
-	// while a smaller value (like this one, due to the left shift) indicates a high difficulty.
-
-	return target
-}
-
 type ErrorCode int
 
 const (
@@ -300,8 +255,7 @@ func NewServerError(errType ErrorType, message string, err error) *ServerError {
 }
 
 const (
-	StopCharacter = "\r\n\r\n"
-	Service       = 0x012 //* This node / all the nodes will only do fullNode since it does everything
+	Service = 0x012 //* This node / all the nodes will only do fullNode since it does everything
 )
 
 type Message struct {
@@ -595,12 +549,6 @@ func GenerateRandomId() int {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return r.Intn(10000) //generates an between 1 - 10000
 }
-func GetVersionMessageSize(VersionMessage VersionMessage) int {
-	var buff bytes.Buffer
-	encoder := gob.NewEncoder(&buff)
-	encoder.Encode(VersionMessage)
-	return len(buff.Bytes())
-}
 
 // ! have to shift these to utils
 func dataByteLen(data []byte) uint32 {
@@ -794,22 +742,6 @@ func (s *Server) BlockTemplate() (DBMan.BlockTemplate, error) {
 	}
 	return template, nil
 }
-func HashBlock(header DBMan.BlockHeader) string {
-	headerData := fmt.Sprintf("%f%s%s%d%d%d",
-		header.Version,
-		header.PrevBlockHash,
-		header.MerkleRoot,
-		header.Timestamp,
-		header.Bits,
-		header.Nonce,
-	)
-	// Double SHA-256 hash
-	hash := sha256.Sum256([]byte(headerData))
-	finalHash := sha256.Sum256(hash[:])
-
-	return hex.EncodeToString(finalHash[:])
-}
-
 func (cn *CNode) OnGetDataReqTX(hash string) error {
 	fmt.Printf("INCOMMING-HASH:%s\n", (hash))
 	txn, err := cn.server.DBMan.GetTxnFromMempool(hash)
@@ -854,9 +786,6 @@ func (cn *CNode) handler() {
 
 		fmt.Printf("Decoded Command: %d\n", msg.Cammand)
 
-		if isTransportOver(string(msg.Data)) {
-			break
-		}
 		if err != nil {
 			message := fmt.Sprintf("error Decoding Message From Peer %v", cn.conn.RemoteAddr())
 			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, message, err)
@@ -1124,9 +1053,9 @@ func (cn *CNode) RequestBlocksForGivenHases(hashes []string) {
 }
 func (s *Server) IsBlockValid(block *DBMan.BlockHeader) bool {
 
-	target := CompactToBig(uint32(block.Bits))
+	target := DBMan.CompactToBig(uint32(block.Bits))
 
-	blockHash := HashBlock(*block)
+	blockHash := DBMan.CalculateBlockHash(*block)
 
 	blockHashInt := new(big.Int)
 	blockHashInt.SetString(blockHash, 16)
@@ -1136,8 +1065,8 @@ func (s *Server) ProcessAndStoreNewMinedBlock(block DBMan.Block) (bool, error) {
 	// Bind the claimed hash to the header: block.Hash must be exactly what
 	// the header hashes to. Without this a peer could ship a block whose
 	// stored hash differs from its actual header hash.
-	if block.Hash != HashBlock(block.Header) {
-		return false, fmt.Errorf("block hash mismatch: stored %s but header hashes to %s", block.Hash, HashBlock(block.Header))
+	if block.Hash != DBMan.CalculateBlockHash(block.Header) {
+		return false, fmt.Errorf("block hash mismatch: stored %s but header hashes to %s", block.Hash, DBMan.CalculateBlockHash(block.Header))
 	}
 
 	// Recompute the merkle root from the transactions ACTUALLY in the block
@@ -1265,21 +1194,6 @@ func (s *Server) StoreInMempoolAndRelay(ctx context.Context, transaction DBMan.T
 		}
 	}
 	return nil, added
-}
-func (s *Server) LogPeers() {
-	time.Sleep(10 * time.Second)
-	s.peersMu.RLock()
-	defer s.peersMu.RUnlock()
-	for _, p := range s.peers {
-		fmt.Print("Peers:\n")
-		fmt.Printf("%s\n", p.Addr)
-		fmt.Printf("%d\n", p.Id)
-		fmt.Printf("%v\n", p.LastServed)
-	}
-}
-
-func isTransportOver(data string) bool {
-	return strings.HasSuffix(data, StopCharacter)
 }
 func (cn *CNode) PingHandler(duration uint8) {
 	ticker := time.NewTicker(time.Duration(duration) * time.Minute)

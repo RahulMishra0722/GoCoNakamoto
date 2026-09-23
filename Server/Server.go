@@ -243,6 +243,7 @@ type Server struct {
 	host             string
 	port             string
 	peers            []*CNode
+	peersMu          sync.RWMutex // guards peers: appended in Run()/Dial(), read by broadcast loops
 	listener         net.Listener
 	done             chan struct{} // We'll use this for shutdown signaling
 	maxPeerLimit     int
@@ -439,13 +440,21 @@ func (s *Server) Run() {
 			}
 
 			log.Printf("New connection accepted from %s", conn.RemoteAddr())
-			if len(s.peers) < s.maxPeerLimit {
+
+			s.peersMu.RLock()
+			hasCapacity := len(s.peers) < s.maxPeerLimit
+			s.peersMu.RUnlock()
+
+			if hasCapacity {
 				newNode := NewCNode(s)
 				newNode.conn = conn
 				newNode.IsInBound = true
 
+				s.peersMu.Lock()
 				s.peers = append(s.peers, &newNode)
-				log.Printf("New peer added. Total peers: %d", len(s.peers))
+				totalPeers := len(s.peers)
+				s.peersMu.Unlock()
+				log.Printf("New peer added. Total peers: %d", totalPeers)
 
 				go newNode.write()
 				go newNode.handler()
@@ -458,8 +467,11 @@ func (s *Server) Run() {
 					newNode.conn = conn
 					newNode.IsInBound = true
 
+					s.peersMu.Lock()
 					s.peers = append(s.peers, &newNode)
-					log.Printf("New peer added. Total peers: %d", len(s.peers))
+					totalPeers := len(s.peers)
+					s.peersMu.Unlock()
+					log.Printf("New peer added. Total peers: %d", totalPeers)
 
 					go newNode.write()
 					go newNode.handler()
@@ -476,6 +488,8 @@ func (s *Server) Run() {
 func (s *Server) Close() {
 	close(s.done)
 	s.listener.Close()
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
 	for _, peer := range s.peers {
 		peer.Close()
 	}
@@ -504,9 +518,12 @@ func (s *Server) Dial(addr string) bool {
 	go newCNode.PingHandler(uint8(s.PingingDuration))
 
 	newCNode.IsInBound = false
+	s.peersMu.Lock()
 	s.peers = append(s.peers, &newCNode)
+	totalPeers := len(s.peers)
+	s.peersMu.Unlock()
 
-	log.Printf("New outgoing peer added. Total peers: %d", len(s.peers))
+	log.Printf("New outgoing peer added. Total peers: %d", totalPeers)
 	return true
 }
 func GenerateRandomId() int {
@@ -559,6 +576,9 @@ func decodeMessage(reader io.Reader) (Message, error) {
 	return msg, nil
 }
 func (s *Server) AttemptToEvictConnection() (bool, error) {
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
+
 	var totalLatency time.Duration
 	var inboundPeers int
 
@@ -1094,6 +1114,8 @@ func (s *Server) BroadCasteBlock(block *DBMan.Block) error {
 	newBlock.Data = buff.Bytes()
 
 	encodedBlock := encodeMessage(newBlock)
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
 	for _, peer := range s.peers {
 		peer.VSend <- encodedBlock
 		peer.block = true
@@ -1125,6 +1147,8 @@ func (s *Server) RelayToKnowPeers(transaction DBMan.Transaction) error {
 	newRelay.Data = data
 	newRelay.Length = length
 	encoded := encodeMessage(newRelay)
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
 	if len(s.peers) > 0 {
 		for _, peer := range s.peers {
 			peer.VSend <- encoded
@@ -1147,6 +1171,8 @@ func (s *Server) StoreInMempoolAndRelay(ctx context.Context, transaction DBMan.T
 }
 func (s *Server) LogPeers() {
 	time.Sleep(10 * time.Second)
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
 	for _, p := range s.peers {
 		fmt.Print("Peers:\n")
 		fmt.Printf("%s\n", p.Addr)
@@ -1362,14 +1388,20 @@ func (s *Server) SendRetryHandler() {
 
 			retry.Attempts++
 
+			s.peersMu.RLock()
+			var target *CNode
 			for _, peer := range s.peers {
 				if peer.Id == retry.PeerId {
-					fmt.Printf("Waiting 10 secs before retrying to resend blocks")
-					time.Sleep(10 * time.Second) // ! this may help with latency
-					peer.PrepareAndSendBlocks(retry.Metadata)
+					target = peer
 					break
 				}
+			}
+			s.peersMu.RUnlock()
 
+			if target != nil {
+				fmt.Printf("Waiting 10 secs before retrying to resend blocks")
+				time.Sleep(10 * time.Second) // ! this may help with latency
+				target.PrepareAndSendBlocks(retry.Metadata)
 			}
 		}
 

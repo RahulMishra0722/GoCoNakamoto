@@ -385,7 +385,7 @@ type Config struct {
 
 // New initializes a new server with the given configuration
 func New(config *Config) *Server {
-	return &Server{
+	s := &Server{
 		host:             config.Host,
 		port:             config.Port,
 		DBMan:            config.DBMan,
@@ -400,6 +400,16 @@ func New(config *Config) *Server {
 		Ctx:              config.Ctx,
 		Cancel:           config.Cancel,
 	}
+
+	// ErrorChan receiver: without this drain loop, the buffer fills at 100
+	// and every goroutine sending an error blocks forever (node freezes).
+	go func() {
+		for serverErr := range s.ErrorChan {
+			s.Log(&serverErr)
+		}
+	}()
+
+	return s
 }
 
 var ServerAddr string

@@ -154,33 +154,11 @@ func HashBlock(header DBMan.BlockHeader) string {
 	return hex.EncodeToString(finalHash[:])
 }
 
-// CalculateMerkleRoot calculates the Merkle root of the transactions
-func CalculateMerkleRoot(transactions []DBMan.Transaction) string {
-	if len(transactions) == 0 {
-		return ""
-	}
-
-	var hashes []string
-	for _, tx := range transactions {
-		hashes = append(hashes, tx.TxnHash)
-	}
-
-	for len(hashes) > 1 {
-		var newHashes []string
-		for i := 0; i < len(hashes); i += 2 {
-			if i+1 == len(hashes) {
-				newHashes = append(newHashes, hashes[i])
-			} else {
-				combinedHash := hashes[i] + hashes[i+1]
-				hash := sha256.Sum256([]byte(combinedHash))
-				newHashes = append(newHashes, doubleSHA256(hash[:]))
-			}
-		}
-		hashes = newHashes
-	}
-
-	return hashes[0] // The last remaining hash is the Merkle root
-}
+// CalculateMerkleRoot was deleted: the miner now uses
+// DBMan.CalculateMerkleRoot — the exact function the validating node
+// recomputes with. Two different merkle implementations (single vs double
+// SHA, bytes vs concatenated hex strings) meant even identical transaction
+// lists produced different roots, so blocks were unvalidatable by design.
 
 func GenerateKeys() (string, string, error) {
 	privateKey, err := btcec.NewPrivateKey(btcec.S256())
@@ -275,13 +253,13 @@ type Template struct {
 	Bits          int
 }
 
-func (m *Miner) NewBlock(merkelRoot string) (*DBMan.Block, error) {
+func (m *Miner) NewBlock() (*DBMan.Block, error) {
 	fmt.Println("Mining starts")
 	var successFullyMinedTransactions []DBMan.Transaction
 	var totalFee float64
 	template, err := m.casheMan.GetBlockTemplate()
 	if err != nil {
-		fmt.Println(err)
+		return &DBMan.Block{}, fmt.Errorf("error getting block template: %w", err)
 	}
 
 	for _, txn := range template.Transactions {
@@ -395,61 +373,52 @@ func (m *Miner) NewBlock(merkelRoot string) (*DBMan.Block, error) {
 	cbaseTxn, err := m.CreateCoinbaseTransaction(totalFee) // push it at the front of the outputs array in block transaction
 
 	if err != nil {
-		fmt.Print(err)
+		return &DBMan.Block{}, fmt.Errorf("error creating coinbase transaction: %w", err)
 	}
+
+	// ORDERING RULE: the merkle root is a fingerprint of the FINAL
+	// transaction list, so every txn must be final (outputs appended,
+	// coinbase hash computed) BEFORE the root is computed. Previously the
+	// root was taken from the raw template txns while the block shipped
+	// a different list (coinbase prepended, outputs appended) — every
+	// validating node recomputing the root rejected the block.
+	cbaseTxn.TxnHash = DBMan.CalculateTransactionHash(cbaseTxn)
+
+	finalTxns := append([]DBMan.Transaction{cbaseTxn}, successFullyMinedTransactions...)
+
+	merkleRoot := DBMan.CalculateMerkleRoot(finalTxns)
 
 	blockHeader := DBMan.BlockHeader{
 		Version:       template.Version,
 		PrevBlockHash: template.PrevBlockHash,
-		MerkleRoot:    merkelRoot,
+		MerkleRoot:    merkleRoot,
 		Timestamp:     template.Timestamp,
 		Bits:          template.Bits,
 		Nonce:         0,
 	}
 
 	Hash := m.ProofOfWork(&blockHeader)
-	cbaseTxn.TxnHash = cbaseTxn.CalculateHash() // Update txn hash before adding to the block
-	cbaseTxn.BlockHash = Hash
 
-	successFullyMinedTransactions = append([]DBMan.Transaction{cbaseTxn}, successFullyMinedTransactions...)
+	// Bind every txn to the block it shipped in (only after the hash exists).
+	for i := range finalTxns {
+		finalTxns[i].BlockHash = Hash
+	}
 
 	block := &DBMan.Block{
 		Height:       template.Height, // since the function returns in a way the last blocks height we gotta + 1 it
 		Header:       blockHeader,
-		Transactions: successFullyMinedTransactions,
+		Transactions: finalTxns,
 		Hash:         Hash,
 	}
-
-	cbaseTxn.BlockHash = block.Hash
 
 	return block, nil
 }
 
-func onTransactionEmpty() string {
-	return strings.Repeat("0", 64)
-}
-
 func (m *Miner) MineBlock() (*DBMan.Block, error) {
-	template, err := m.casheMan.GetBlockTemplate()
-	if err != nil {
-		return &DBMan.Block{}, fmt.Errorf("error MineBlock %w", err)
-	}
-
-	if len(template.Transactions) == 0 {
-		root := onTransactionEmpty()
-		block, err :=
-			m.NewBlock(
-				root,
-			)
-		if err != nil {
-			fmt.Printf("Error creating empty block: %v\n", err)
-		}
-		return block, err
-
-	}
-	root := CalculateMerkleRoot(template.Transactions)
-
-	block, err := m.NewBlock(root)
+	// NOTE: the merkle root is deliberately NOT computed here. It must be
+	// taken over the FINAL transaction list inside NewBlock, after sig
+	// validation, output construction and the coinbase have been assembled.
+	block, err := m.NewBlock()
 	if err != nil {
 		fmt.Printf("Error occurred during block creation: %v\n", err)
 	}

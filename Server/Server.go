@@ -1119,6 +1119,21 @@ func (s *Server) IsBlockValid(block *DBMan.BlockHeader) bool {
 	return blockHashInt.Cmp(target) == -1
 }
 func (s *Server) ProcessAndStoreNewMinedBlock(block DBMan.Block) (bool, error) {
+	// Bind the claimed hash to the header: block.Hash must be exactly what
+	// the header hashes to. Without this a peer could ship a block whose
+	// stored hash differs from its actual header hash.
+	if block.Hash != HashBlock(block.Header) {
+		return false, fmt.Errorf("block hash mismatch: stored %s but header hashes to %s", block.Hash, HashBlock(block.Header))
+	}
+
+	// Recompute the merkle root from the transactions ACTUALLY in the block
+	// and compare with the header's fingerprint. This is the check that
+	// would have caught the miner's ordering bug.
+	recomputedRoot := DBMan.CalculateMerkleRoot(block.Transactions)
+	if recomputedRoot != block.Header.MerkleRoot {
+		return false, fmt.Errorf("merkle root mismatch: header %s but transactions hash to %s", block.Header.MerkleRoot, recomputedRoot)
+	}
+
 	if s.IsBlockValid(&block.Header) {
 		fmt.Println(true)
 		for _, txn := range block.Transactions {

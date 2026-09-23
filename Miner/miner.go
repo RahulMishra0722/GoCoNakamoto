@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RahulMishra0722/GC/DBMan"
-	MinerCacheMan "github.com/RahulMishra0722/GC/MinerCasheMan"
+	"github.com/RahulMishra0722/GoCoNakamoto/DBMan"
+	MinerCacheMan "github.com/RahulMishra0722/GoCoNakamoto/MinerCasheMan"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"go.uber.org/zap/buffer"

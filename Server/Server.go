@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RahulMishra0722/GC/Addrman"
-	"github.com/RahulMishra0722/GC/DBMan"
-	"github.com/RahulMishra0722/GC/Utils"
+	"github.com/RahulMishra0722/GoCoNakamoto/Addrman"
+	"github.com/RahulMishra0722/GoCoNakamoto/DBMan"
+	"github.com/RahulMishra0722/GoCoNakamoto/Utils"
 )
 
 type CMD uint8

@@ -1,4 +1,4 @@
-module github.com/RahulMishra0722/GC
+module github.com/RahulMishra0722/GoCoNakamoto
 
 go 1.25
 

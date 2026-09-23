@@ -5,7 +5,7 @@ import (
 	"encoding/gob"
 	"fmt"
 
-	"github.com/RahulMishra0722/GC/DBMan"
+	"github.com/RahulMishra0722/GoCoNakamoto/DBMan"
 )
 
 type Utils struct {

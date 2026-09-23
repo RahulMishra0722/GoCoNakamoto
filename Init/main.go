@@ -5,9 +5,9 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/RahulMishra0722/GC/DBMan"
-	"github.com/RahulMishra0722/GC/RpcServer"
-	"github.com/RahulMishra0722/GC/Server"
+	"github.com/RahulMishra0722/GoCoNakamoto/DBMan"
+	"github.com/RahulMishra0722/GoCoNakamoto/RpcServer"
+	"github.com/RahulMishra0722/GoCoNakamoto/Server"
 )
 
 func CORSMiddleware(next http.Handler) http.Handler {

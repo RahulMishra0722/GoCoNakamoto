@@ -321,8 +321,8 @@ type CNode struct {
 	server           *TestServer
 	block            bool
 	IsInBound        bool
-	SentBytes        uint16
-	RecievedBytes    uint16
+	SentBytes        uint64
+	RecievedBytes    uint64
 	Timer            *Timer
 	Latency          time.Duration
 }
@@ -793,7 +793,7 @@ func (cn *CNode) handler() {
 			msg.Data = buff.Bytes()
 			msg.Length = length
 			encoded := encodeMessage(msg)
-			cn.SentBytes += uint16(length)
+			cn.SentBytes += uint64(length)
 			cn.VSend <- encoded
 		} else if msg.Cammand == byte(INV) {
 			// * check in db if we already have this txn
@@ -927,7 +927,7 @@ func (cn *CNode) ValidateAndStoreNewRecivedBlocks(blocks []DBMan.Block) error {
 		if err != nil {
 			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error Storing Recived Blocks", err)
 		}
-		cn.RecievedBytes += block.BytesLen()
+		cn.RecievedBytes += uint64(block.BytesLen())
 	}
 
 	return nil

@@ -377,10 +377,10 @@ func InitDB(path string) (*DBman, error) {
 
 	return db, nil
 }
-func (b *Block) BytesLen() uint16 {
+func (b *Block) BytesLen() uint32 {
 	var buff bytes.Buffer
 	gob.NewEncoder(&buff).Encode(b)
-	return uint16(buff.Len())
+	return uint32(buff.Len())
 }
 func (tx *Transaction) CalculateHash() string {
 

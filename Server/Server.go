@@ -56,10 +56,15 @@ const (
 const (
 	VERSION_BYTE = 1
 	CMD_BYTE     = 1
-	LENGTH_BYTES = 2
+	LENGTH_BYTES = 4 // uint32: blocks exceed uint16's 64KB and silently truncated
 	version      = 0.1
 	Difficulty   = 0x1e00ffff
 )
+
+// MaxMessageSize caps incoming payloads before allocation so a hostile peer
+// can't make us allocate huge buffers via a forged length header (same idea
+// as Bitcoin Core's MAX_SIZE).
+const MaxMessageSize = 32 * 1024 * 1024 // 32MB
 
 //! 0x1e00ffff
 /*
@@ -302,7 +307,7 @@ const (
 type Message struct {
 	Version byte
 	Cammand byte
-	Length  uint16
+	Length  uint32
 	Data    []byte
 }
 type Timer struct {
@@ -360,8 +365,8 @@ type CNode struct {
 	Utils         *Utils.Utils
 	server        *Server
 	IsInBound     bool
-	SentBytes     uint16
-	RecievedBytes uint16
+	SentBytes     uint64
+	RecievedBytes uint64
 	Timer         *Timer
 	Latency       time.Duration
 }
@@ -581,8 +586,8 @@ func GetVersionMessageSize(VersionMessage VersionMessage) int {
 }
 
 // ! have to shift these to utils
-func dataByteLen(data []byte) uint16 {
-	return uint16(len(data))
+func dataByteLen(data []byte) uint32 {
+	return uint32(len(data))
 }
 
 func encodeMessage(Message Message) []byte {
@@ -590,8 +595,8 @@ func encodeMessage(Message Message) []byte {
 	buffer := make([]byte, totalLength)
 	buffer[0] = Message.Version
 	buffer[1] = Message.Cammand
-	binary.BigEndian.PutUint16(buffer[2:4], Message.Length)
-	copy(buffer[4:], Message.Data)
+	binary.BigEndian.PutUint32(buffer[2:6], Message.Length)
+	copy(buffer[6:], Message.Data)
 	fmt.Printf("Encoded Command: %d\n", Message.Cammand)
 	return buffer
 }
@@ -602,7 +607,10 @@ func decodeMessage(reader io.Reader) (Message, error) {
 	if err != nil {
 		return Message{}, err
 	}
-	length := binary.BigEndian.Uint16(header[2:4])
+	length := binary.BigEndian.Uint32(header[2:6])
+	if length > MaxMessageSize {
+		return Message{}, fmt.Errorf("declared message length %d exceeds limit %d", length, MaxMessageSize)
+	}
 	data := make([]byte, length)
 	_, err = io.ReadFull(reader, data)
 	if err != nil {
@@ -890,7 +898,7 @@ func (cn *CNode) handler() {
 			msg.Data = buff.Bytes()
 			msg.Length = length
 			encoded := encodeMessage(msg)
-			cn.SentBytes += uint16(length)
+			cn.SentBytes += uint64(length)
 			cn.VSend <- encoded
 		} else if msg.Cammand == byte(INV) {
 			// * check in db if we already have this txn
@@ -1021,7 +1029,7 @@ func (cn *CNode) ValidateAndStoreNewRecivedBlocks(blocks []DBMan.Block) error {
 		if err != nil {
 			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error Storing Recived Blocks", err)
 		}
-		cn.RecievedBytes += block.BytesLen()
+		cn.RecievedBytes += uint64(block.BytesLen())
 	}
 
 	return nil

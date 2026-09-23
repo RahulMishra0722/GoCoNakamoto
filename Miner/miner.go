@@ -20,7 +20,6 @@ import (
 	MinerCacheMan "github.com/RahulMishra0722/GC/MinerCasheMan"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	v2ecdsa "github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"go.uber.org/zap/buffer"
 )
 
@@ -141,43 +140,6 @@ func (m *Miner) ProofOfWork(block *DBMan.BlockHeader) string {
 	}
 }
 
-func ValidateSignature(pubKeyString string, transactionHash string, signatureHex string) (bool, error) {
-
-	pubKeyBytes, err := hex.DecodeString(pubKeyString)
-	if err != nil {
-		return false, fmt.Errorf("error decoding public key: %v", err)
-	}
-
-	pubkey, err := btcec.ParsePubKey(pubKeyBytes)
-	if err != nil {
-		return false, fmt.Errorf("error parsing public key: %v", err)
-	}
-
-	signatureBytes, err := hex.DecodeString(signatureHex)
-	if err != nil {
-		return false, fmt.Errorf("error decoding signature: %v", err)
-	}
-
-	signature, err := v2ecdsa.ParseDERSignature(signatureBytes)
-	if err != nil {
-		return false, fmt.Errorf("error parsing signature: %v", err)
-	}
-
-	txnHashBytes, err := hex.DecodeString(transactionHash)
-	if err != nil {
-		return false, fmt.Errorf("error decoding transaction hash: %v", err)
-	}
-	msgHash := sha256.Sum256(txnHashBytes)
-
-	valid := signature.Verify(msgHash[:], pubkey)
-	fmt.Print(valid)
-	if !valid {
-		fmt.Print("\n", "Signature failed", "\n")
-	}
-	fmt.Print("\n", "Signature Succeeded", "\n")
-	return valid, nil
-}
-
 func (m *Miner) ConvertTransactionsToByteArray(transactions []DBMan.Transaction) [][]byte {
 
 	var transactionInBytes [][]byte
@@ -207,7 +169,7 @@ func (m *Miner) NewBlock() (*DBMan.Block, error) {
 	}
 
 	for _, txn := range template.Transactions {
-		isValid, err := ValidateSignature(txn.Sender, txn.TxnHash, txn.Signature)
+		isValid, err := DBMan.ValidateSignature(txn.Sender, txn.SigningHash, txn.Signature, &txn)
 		if err != nil {
 			fmt.Printf("invalid txn Signature verification falled with err: %v", err)
 			// If sig fails reject txn and continue
@@ -231,14 +193,14 @@ func (m *Miner) NewBlock() (*DBMan.Block, error) {
 					Value:        totalValue - txn.Amount - txn.Fee,
 					ScriptPubKey: txn.Sender,
 				}
-				var prevHash string
-				for _, input := range txn.Inputs {
-					prevHash = input.PreviousOutput.Hash // im not sure if the inputs will look like this but for now we pick any of the utxo input and grab the txnHash and exit
-					// *Previos hash is the hash of the transaction that created the utxo, i know names confusing
-					break
-				}
+				// BOTH outputs belong to THIS transaction, so both outpoints
+				// must reference this txn's hash. Previously the receiver's
+				// outpoint pointed at the INPUT's prev hash — the hash of the
+				// transaction that created the UTXO being spent — which
+				// corrupts UTXO identity: spending logic and double-spend
+				// detection key on (prev hash, index).
 				recieverOutPoint := DBMan.OutPoint{
-					Hash:  prevHash,
+					Hash:  txn.TxnHash,
 					Index: 0, //* ill only be allowing two outputs one and that is if the sender sent more than whats being transefered 1 otherwise so index 0, 1 and is fine unless i decide to change it
 				}
 				senderUtxoOutPoint := DBMan.OutPoint{
@@ -285,14 +247,10 @@ func (m *Miner) NewBlock() (*DBMan.Block, error) {
 					Value:        txn.Amount,
 					ScriptPubKey: txn.Receiver,
 				}
-				var prevHash string
-				for _, input := range txn.Inputs {
-					prevHash = input.PreviousOutput.Hash // im not sure if the inputs will look like this but for now we pick any of the utxo input and grab the txnHash and exit
-					break
-				}
+				// This txn's own hash, like every outpoint of its outputs.
 				recieverOutPoint := DBMan.OutPoint{
-					Hash:  prevHash,
-					Index: 0, //* ill only be allowing two outputs one and that is if the sender sent more than whats being transefered 1 otherwise so index 0, 1 and is fine unless i decide to change it
+					Hash:  txn.TxnHash,
+					Index: 0,
 				}
 
 				outputRecieverUtxo := DBMan.Utxo{

@@ -55,7 +55,8 @@ const (
 	CMD_BYTE     = 1
 	LENGTH_BYTES = 4 // uint32: blocks exceed uint16's 64KB and silently truncated
 	version      = 0.1
-	Difficulty   = 0x1e00ffff
+	// Difficulty consensus constant lives in DBMan (DBMan.Difficulty) next
+	// to the retargeting logic it belongs to.
 )
 
 // MaxMessageSize caps incoming payloads before allocation so a hostile peer
@@ -731,13 +732,22 @@ func (s *Server) BlockTemplate() (DBMan.BlockTemplate, error) {
 		fmt.Println(err)
 	}
 
+	// The difficulty for the next block is decided by CONSENSUS, not by
+	// this node: it is whatever ExpectedBitsForHeight prescribes for the
+	// height we're about to mine. (template.Height is the next block's
+	// height — miners PoW against exactly these Bits.)
+	expectedBits, bitsErr := s.DBMan.ExpectedBitsForHeight(height + 1)
+	if bitsErr != nil {
+		return DBMan.BlockTemplate{}, fmt.Errorf("error computing expected difficulty for height %d: %w", height+1, bitsErr)
+	}
+
 	template := DBMan.BlockTemplate{
 		Version:       version,
 		Height:        height + 1,
 		Transactions:  transactions,
 		PrevBlockHash: prevHash,
 		MerkleRoot:    "",
-		Bits:          Difficulty,
+		Bits:          expectedBits,
 		Timestamp:     time.Now().Unix(),
 	}
 	return template, nil
@@ -1075,6 +1085,17 @@ func (s *Server) ProcessAndStoreNewMinedBlock(block DBMan.Block) (bool, error) {
 	recomputedRoot := DBMan.CalculateMerkleRoot(block.Transactions)
 	if recomputedRoot != block.Header.MerkleRoot {
 		return false, fmt.Errorf("merkle root mismatch: header %s but transactions hash to %s", block.Header.MerkleRoot, recomputedRoot)
+	}
+
+	// The block cannot choose its own difficulty: the claimed Bits must
+	// equal what consensus prescribes for this height.
+	expectedBits, bitsErr := s.DBMan.ExpectedBitsForHeight(block.Height)
+	if bitsErr != nil {
+		return false, fmt.Errorf("error computing expected difficulty for height %d: %w", block.Height, bitsErr)
+	}
+	if block.Header.Bits != expectedBits {
+		return false, fmt.Errorf("difficulty mismatch: block claims bits %d but consensus expects %d at height %d",
+			block.Header.Bits, expectedBits, block.Height)
 	}
 
 	if s.IsBlockValid(&block.Header) {

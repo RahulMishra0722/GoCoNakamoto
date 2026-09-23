@@ -6,15 +6,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/binary"
-	"math/big"
 	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"sort"
 	"sync"
 
+	"github.com/btcsuite/btcd/btcec/v2"
+	v2ecdsa "github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"go.etcd.io/bbolt"
 )
 
@@ -51,24 +53,41 @@ type BlockHeader struct {
 }
 
 type Transaction struct {
-	BlockHash  string //Block Hash what block this transaction was formed in
-	TxnHash    string // Transaction hash
-	Sender     string // Sender's public key (not used in coinbase)
-	Receiver   string // Coinbase transactions for rewarding miner
-	Signature  string // Signature of the transaction
-	Amount     int64  // Total amount, in satoshis (1 GXC = 100,000,000 satoshis) — never floats
-	Inputs     []Utxo // Inputs for the transaction
-	Outputs    []Utxo // Outputs for the transaction
-	LockTime   uint32 // Lock time for the transaction
-	IsCoinbase bool   // Indicates if the transaction is a coinbase transaction
-	Height     uint32 // Block height for the coinbase transaction
-	Subsidy    int64  // Mining subsidy, in satoshis
-	Fee        int64
+	BlockHash string //Block Hash what block this transaction was formed in
+	TxnHash   string // Transaction hash
+	// SigningHash is SHA256 of the SIGNING PAYLOAD (everything below minus
+	// the signature itself). The wallet signs these exact 32 bytes; nodes
+	// recompute it from the received fields and verify the signature over
+	// it. Never confuse this with TxnHash (which covers the signature too
+	// and is only an identity, never a signing target).
+	SigningHash string // Hex-encoded sha256 of the signing payload
+	Sender      string // Sender's public key (not used in coinbase)
+	Receiver    string // Coinbase transactions for rewarding miner
+	Signature   string // DER signature over SigningHash (hex)
+	Amount      int64  // Total amount, in satoshis (1 GXC = 100,000,000 satoshis) — never floats
+	Inputs      []Utxo // Inputs for the transaction
+	Outputs     []Utxo // Outputs for the transaction
+	LockTime    uint32 // Lock time for the transaction
+	IsCoinbase  bool   // Indicates if the transaction is a coinbase transaction
+	Height      uint32 // Block height for the coinbase transaction
+	Subsidy     int64  // Mining subsidy, in satoshis
+	Fee         int64
 }
 
 // SatoshisPerCoin: the smallest unit is the satoshi; 1 GXC = 100,000,000 satoshis.
 // All monetary amounts anywhere in the codebase are satoshis (int64).
 const SatoshisPerCoin int64 = 100_000_000
+
+// Difficulty consensus constants. Bits are the compact difficulty target.
+const (
+	// Difficulty is the base difficulty for the first epoch.
+	Difficulty int = 0x1e00ffff
+	// RetargetInterval: difficulty is retargeted every N blocks.
+	RetargetInterval = 10
+	// TargetSecondsPerBlock: the desired average time between blocks.
+	// Toy chain: one block per minute.
+	TargetSecondsPerBlock int64 = 60
+)
 
 type BlockTemplate struct {
 	PrevBlockHash string        `json:"previousBlockHash"`
@@ -217,7 +236,7 @@ func (dm *DBman) GenerateGenesisBlock() (*Block, Transaction, error) {
 		PrevBlockHash: "0000000000000000000000000000000000000000000000000000000000000000",
 		MerkleRoot:    "",
 		Timestamp:     0,
-		Bits:          0x1d00ffff,
+		Bits:          Difficulty,
 		Nonce:         0,
 	}
 
@@ -278,6 +297,7 @@ func CalculateMerkleRoot(transactions []Transaction) string {
 
 	return hex.EncodeToString(hashes[0])
 }
+
 // PrivKeyToHex renders a private key scalar as a fixed-width hex string.
 func PrivKeyToHex(privKey *ecdsa.PrivateKey) string {
 	return fmt.Sprintf("%064x", privKey.D)
@@ -318,6 +338,140 @@ func CompactToBig(compact uint32) *big.Int {
 	return target
 }
 
+// BigToCompact converts a big.Int target into the compact difficulty
+// representation (inverse of CompactToBig, standard Bitcoin algorithm).
+// The compact form stores only the exponent + top 3 mantissa bytes — do
+// NOT shift the mantissa further (it overflows uint32 and silently zeroes).
+func BigToCompact(n *big.Int) uint32 {
+	if n.Sign() == 0 {
+		return 0
+	}
+	b := n.Bytes()
+	// If the top byte has its high bit set, the mantissa would collide with
+	// the sign bit that CompactToBig masks off (0x00800000) — decoding would
+	// lose the high bit. Prepend a zero byte, exactly like Bitcoin's encoding.
+	if b[0]&0x80 != 0 {
+		b = append([]byte{0}, b...)
+	}
+	exponent := uint32(len(b))
+	if exponent > 255 {
+		return 0
+	}
+	var mantissa uint32
+	if exponent <= 3 {
+		mantissa = uint32(b[0])
+		if len(b) > 1 {
+			mantissa = mantissa<<8 | uint32(b[1])
+		}
+		if len(b) > 2 {
+			mantissa = mantissa<<8 | uint32(b[2])
+		}
+		mantissa <<= 8 * (3 - exponent)
+		exponent = 3
+	} else {
+		mantissa = uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
+	}
+	return exponent<<24 | mantissa
+}
+
+// GetBlockByHeight scans the Blocks bucket for the block with the given
+// height. O(n) over stored blocks — fine for a toy chain; a height->hash
+// index would replace this on a real one.
+func (dm *DBman) GetBlockByHeight(height int) (Block, error) {
+	var found Block
+	foundExists := false
+	err := dm.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte("Blocks"))
+		if bucket == nil {
+			return fmt.Errorf("bucket Blocks does not exist")
+		}
+		cursor := bucket.Cursor()
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			var block Block
+			if err := gob.NewDecoder(bytes.NewReader(v)).Decode(&block); err != nil {
+				return fmt.Errorf("failed to decode block %s: %w", string(k), err)
+			}
+			if block.Height == height {
+				found = block
+				foundExists = true
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return Block{}, err
+	}
+	if !foundExists {
+		return Block{}, fmt.Errorf("no block at height %d", height)
+	}
+	return found, nil
+}
+
+// ExpectedBitsForHeight returns the difficulty the chain CONSENSUS requires
+// for a block at the given height. Validators compare the header's claimed
+// Bits against this — a block cannot set its own difficulty.
+//
+// Epochs are RetargetInterval blocks long. At the first block of a new
+// epoch (height k*RetargetInterval+1), the target is adjusted from the
+// previous epoch's bits by actualElapsed/desiredElapsed, clamped to a
+// 4x change per retarget (Bitcoin's rule — prevents wild swings from a
+// single anomalous epoch).
+func (dm *DBman) ExpectedBitsForHeight(height int) (int, error) {
+	// First epoch: base difficulty.
+	if height <= RetargetInterval {
+		return Difficulty, nil
+	}
+
+	// Inside an epoch: bits are whatever the epoch's first block used.
+	if (height-1)%RetargetInterval != 0 {
+		epochStart := ((height-1)/RetargetInterval)*RetargetInterval + 1
+		if epochStart <= 1 {
+			return Difficulty, nil
+		}
+		epochStartBlock, err := dm.GetBlockByHeight(epochStart)
+		if err != nil {
+			return 0, fmt.Errorf("retarget lookup failed: %w", err)
+		}
+		return epochStartBlock.Header.Bits, nil
+	}
+
+	// Retarget boundary: measure the previous epoch's wall-clock time.
+	prevEpochEnd := height - RetargetInterval
+	first, err := dm.GetBlockByHeight(prevEpochEnd - RetargetInterval + 1)
+	if err != nil {
+		return 0, fmt.Errorf("retarget lookup failed: %w", err)
+	}
+	last, err := dm.GetBlockByHeight(prevEpochEnd)
+	if err != nil {
+		return 0, fmt.Errorf("retarget lookup failed: %w", err)
+	}
+
+	actualSeconds := last.Header.Timestamp - first.Header.Timestamp
+	expectedSeconds := int64(RetargetInterval) * TargetSecondsPerBlock
+	if actualSeconds <= 0 {
+		// Degenerate (timestamps equal/too fast): min adjustment toward faster.
+		actualSeconds = 1
+	}
+
+	oldTarget := CompactToBig(uint32(last.Header.Bits))
+	newTarget := new(big.Int).Set(oldTarget)
+	newTarget.Mul(newTarget, big.NewInt(actualSeconds))
+	newTarget.Div(newTarget, big.NewInt(expectedSeconds))
+
+	// Clamp to [oldTarget/4, oldTarget*4].
+	maxTarget := new(big.Int).Mul(oldTarget, big.NewInt(4))
+	minTarget := new(big.Int).Div(oldTarget, big.NewInt(4))
+	if newTarget.Cmp(maxTarget) > 0 {
+		newTarget = maxTarget
+	}
+	if newTarget.Cmp(minTarget) < 0 {
+		newTarget = minTarget
+	}
+
+	return int(BigToCompact(newTarget)), nil
+}
+
 func CalculateTransactionHash(tx Transaction) string {
 	// Amount/Subsidy are int64 satoshis and hash as %d. NOTE: this changes
 	// the txn hash format — the wallet repo must use the same format when
@@ -335,6 +489,78 @@ func CalculateTransactionHash(tx Transaction) string {
 
 	hash := sha256.Sum256(txBytes)
 	return hex.EncodeToString(hash[:])
+}
+
+// SigningPayload returns the canonical byte string that gets SIGNED.
+// Deliberately EXCLUDES: Signature (can't sign itself), TxnHash and
+// BlockHash (identity fields, not authorization data). INCLUDES the input
+// outpoint IDs so a signed intent is bound to specific UTXOs — a signature
+// cannot be replayed on a transaction spending different coins.
+func (tx *Transaction) SigningPayload() []byte {
+	var buf bytes.Buffer
+	buf.WriteString(tx.Sender)
+	buf.WriteString(tx.Receiver)
+	amountBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(amountBytes, uint64(tx.Amount))
+	buf.Write(amountBytes)
+	feeBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(feeBytes, uint64(tx.Fee))
+	buf.Write(feeBytes)
+	lockTimeBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lockTimeBytes, tx.LockTime)
+	buf.Write(lockTimeBytes)
+	for _, in := range tx.Inputs {
+		buf.WriteString(in.Id)
+	}
+	return buf.Bytes()
+}
+
+// SigningHashHex computes the hash the wallet must sign: sha256 of the
+// signing payload, hex-encoded. Nodes recompute and compare with the
+// received SigningHash field before verifying the signature.
+func (tx *Transaction) SigningHashHex() string {
+	h := sha256.Sum256(tx.SigningPayload())
+	return hex.EncodeToString(h[:])
+}
+
+// ValidateSignature verifies a DER secp256k1 signature over the signing
+// hash. It also refuses when the supplied signing hash doesn't match what
+// the transaction content actually hashes to — the signature must commit
+// to THIS transaction, not to whatever bytes the sender typed.
+func ValidateSignature(pubKeyString string, signingHashHex string, signatureHex string, tx *Transaction) (bool, error) {
+	if tx != nil {
+		if recomputed := tx.SigningHashHex(); recomputed != signingHashHex {
+			return false, fmt.Errorf("signing hash mismatch: supplied %s but transaction content hashes to %s", signingHashHex, recomputed)
+		}
+	}
+
+	pubKeyBytes, err := hex.DecodeString(pubKeyString)
+	if err != nil {
+		return false, fmt.Errorf("error decoding public key: %v", err)
+	}
+
+	pubkey, err := btcec.ParsePubKey(pubKeyBytes)
+	if err != nil {
+		return false, fmt.Errorf("error parsing public key: %v", err)
+	}
+
+	signatureBytes, err := hex.DecodeString(signatureHex)
+	if err != nil {
+		return false, fmt.Errorf("error decoding signature: %v", err)
+	}
+
+	signature, err := v2ecdsa.ParseDERSignature(signatureBytes)
+	if err != nil {
+		return false, fmt.Errorf("error parsing signature: %v", err)
+	}
+
+	msgHash, err := hex.DecodeString(signingHashHex)
+	if err != nil {
+		return false, fmt.Errorf("error decoding signing hash: %v", err)
+	}
+
+	valid := signature.Verify(msgHash, pubkey)
+	return valid, nil
 }
 
 func InitDB(path string) (*DBman, error) {
@@ -1183,4 +1409,3 @@ func (dm *DBman) GetBalance(pubkey string) (int64, []Utxo, error) {
 
 	return balance, utxos, nil
 }
-

@@ -1,8 +1,6 @@
 package RpcServer
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,8 +9,6 @@ import (
 
 	"github.com/RahulMishra0722/GC/DBMan"
 	"github.com/RahulMishra0722/GC/Server"
-	"github.com/btcsuite/btcd/btcec/v2"
-	v2ecdsa "github.com/btcsuite/btcd/btcec/v2/ecdsa"
 )
 
 type RpcServer struct {
@@ -21,45 +17,12 @@ type RpcServer struct {
 	Mempool map[string]DBMan.Transaction
 }
 
-func ValidateSignature(pubKeyString string, transactionHash string, signatureHex string) (bool, error) {
-
-	pubKeyBytes, err := hex.DecodeString(pubKeyString)
-	if err != nil {
-		return false, fmt.Errorf("error decoding public key: %v", err)
-	}
-
-	pubkey, err := btcec.ParsePubKey(pubKeyBytes)
-	if err != nil {
-		return false, fmt.Errorf("error parsing public key: %v", err)
-	}
-
-	signatureBytes, err := hex.DecodeString(signatureHex)
-	if err != nil {
-		return false, fmt.Errorf("error decoding signature: %v", err)
-	}
-
-	signature, err := v2ecdsa.ParseDERSignature(signatureBytes)
-	if err != nil {
-		return false, fmt.Errorf("error parsing signature: %v", err)
-	}
-
-	txnHashBytes, err := hex.DecodeString(transactionHash)
-	if err != nil {
-		return false, fmt.Errorf("error decoding transaction hash: %v", err)
-	}
-	msgHash := sha256.Sum256(txnHashBytes)
-
-	valid := signature.Verify(msgHash[:], pubkey)
-	fmt.Print(valid)
-	if !valid {
-		fmt.Print("\n", "Signature failed", "\n")
-	}
-	fmt.Print("\n", "Signature Succeeded", "\n")
-	return valid, nil
-}
-
-type GetBalance struct {
-	PrivateKey string `json:"PrivateKey"`
+// BalanceRequest: the field is a PUBLIC KEY (it's matched against
+// ScriptPubKey). It used to be named PrivateKey and passed as a URL query
+// param — both wrong: the name invited sending actual private keys, and
+// URLs leak into logs/history.
+type BalanceRequest struct {
+	PublicKey string `json:"PublicKey"`
 }
 
 func NewRpcServer(server *Server.Server, DB *DBMan.DBman, mempool map[string]DBMan.Transaction) *RpcServer {
@@ -69,32 +32,28 @@ func NewRpcServer(server *Server.Server, DB *DBMan.DBman, mempool map[string]DBM
 		Mempool: mempool,
 	}
 }
+
 func (rpc *RpcServer) GetBalanceHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	// CORS is handled by the middleware in main.go — no per-handler headers.
 
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	privateKey := r.URL.Query().Get("PublicKey")
-
-	if privateKey == "" {
-		http.Error(w, "PrivateKey is missing", http.StatusBadRequest)
+	var req BalanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "error parsing request body", http.StatusBadRequest)
+		return
+	}
+	publicKey := req.PublicKey
+	if publicKey == "" {
+		http.Error(w, "PublicKey is missing", http.StatusBadRequest)
 		return
 	}
 
-	// Get balance from the DB based on the PrivateKey
-	//Todo get it as a dependecy im going insane
-
-	balance, utxo, err := rpc.DBman.GetBalance(privateKey)
+	// Get balance from the DB based on the public key
+	balance, utxo, err := rpc.DBman.GetBalance(publicKey)
 	if err != nil {
 		fmt.Print(err)
 		http.Error(w, "Failed to fetch balance", http.StatusInternalServerError)
@@ -102,9 +61,9 @@ func (rpc *RpcServer) GetBalanceHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	response := map[string]interface{}{
-		"PrivateKey": privateKey,
-		"balance":    balance,
-		"UTXO":       utxo,
+		"PublicKey": publicKey,
+		"balance":   balance,
+		"UTXO":      utxo,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -133,7 +92,7 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := reqOuter.Transaction
-	valid, sigErr := ValidateSignature(req.Sender, req.TxnHash, req.Signature)
+	valid, sigErr := DBMan.ValidateSignature(req.Sender, req.SigningHash, req.Signature, &req)
 	if sigErr != nil || !valid {
 		response := map[string]interface{}{
 			"Response": "Invalid Signature transaction is being rejected",
@@ -166,18 +125,7 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 func (rpc *RpcServer) SubmitBlock(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
+	// CORS is handled by the middleware in main.go.
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -211,17 +159,11 @@ func (rpc *RpcServer) SubmitBlock(w http.ResponseWriter, r *http.Request) {
 	// m.DBman.StoreUTXO(outputSenderUtxo.Id, outputSenderUtxo)
 }
 func (rpc *RpcServer) GetBlockTemplate(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.WriteHeader(http.StatusOK)
+	// CORS is handled by the middleware in main.go.
+	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodOptions {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	template, err := rpc.Connman.BlockTemplate()
 
 	if err != nil {

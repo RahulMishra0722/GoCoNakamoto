@@ -141,12 +141,22 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	if err := rpc.Connman.DBMan.AddToMempool(req.TxnHash, req); err != nil {
-		http.Error(w, fmt.Sprintf("transaction rejected: %v", err), http.StatusBadRequest)
+	// Full verification (UTXO existence, balance against STORED values,
+	// mempool dedup, mempool insert) + relay to peers — the same path a
+	// peer-relayed transaction takes, so wallet txns and network txns
+	// can't diverge in what they accept.
+	relayErr, wasAdded := rpc.Connman.StoreInMempoolAndRelay(rpc.Connman.Ctx, req)
+	if relayErr != nil {
+		http.Error(w, fmt.Sprintf("transaction rejected: %v", relayErr), http.StatusBadRequest)
 		return
 	}
-	if err := rpc.Connman.RelayToKnowPeers(req); err != nil {
-		log.Printf("SendTransaction: failed to relay txn %s to peers: %v", req.TxnHash, err)
+	if !wasAdded {
+		response := map[string]interface{}{
+			"Response": "Transaction already known to this node",
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+		return
 	}
 	response := map[string]interface{}{
 		"Response": "We Have Recived Your Transaction wait till The Node will verifies your transaction",

@@ -260,7 +260,7 @@ func (dm *DBman) GenerateGenesisBlock() (*Block, Transaction, error) {
 	block.Header.MerkleRoot = merkleRoot
 
 	blockHash := CalculateBlockHash(block.Header)
-	fmt.Println("Genesis Block hash %s", blockHash)
+	fmt.Printf("Genesis Block hash %s\n", blockHash)
 	block.Hash = blockHash
 
 	block.Transactions[0].BlockHash = blockHash
@@ -504,7 +504,15 @@ func (dm *DBman) VerifyTransaction(ctx context.Context, transaction Transaction)
 						log.Printf("VerifyTransaction: Invalid input found for UTXO %s", utxo.Id)
 						return fmt.Errorf("invalid Inputs Input-Id: %s", string(utxo.Id))
 					}
-					total += utxo.Output.Value
+					// Use the STORED UTXO's value, not the value the sender
+					// claims in the transaction. Otherwise a forged wallet
+					// could inflate its balance by claiming inputs hold
+					// more than the chain says they do.
+					stored, err := DeserializeUTXO(data)
+					if err != nil {
+						return fmt.Errorf("failed to deserialize stored UTXO %s: %w", utxo.Id, err)
+					}
+					total += stored.Output.Value
 				}
 			}
 

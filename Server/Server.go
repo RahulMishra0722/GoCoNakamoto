@@ -318,22 +318,52 @@ func (t *Timer) ElapsedTime() time.Duration {
 	return time.Since(t.start)
 }
 
+// PeerState is an explicit state machine for a peer connection. It replaces
+// boolean soup (ExchangedVersion, the deleted `block` flag) with named states
+// and defined transitions, mirroring Bitcoin Core's CNodeState.
+type PeerState int
+
+const (
+	// StateNegotiating: connection accepted/dialed, version handshake in
+	// progress. Only VERSION/VERACK/PING messages are processed.
+	StateNegotiating PeerState = iota
+	// StateReady: version+verack exchanged on both sides. Full protocol.
+	StateReady
+	// StateEvicted: selected for eviction, pending disconnect.
+	// (Eviction currently doesn't disconnect; reserved for that change.)
+	StateEvicted
+)
+
+func (ps PeerState) String() string {
+	switch ps {
+	case StateNegotiating:
+		return "negotiating"
+	case StateReady:
+		return "ready"
+	case StateEvicted:
+		return "evicted"
+	default:
+		return "unknown"
+	}
+}
+
 // CNode represents a client node in the network
 type CNode struct {
-	Id               int
-	conn             net.Conn
-	done             chan struct{}
-	VSend            chan []byte
-	Addr             net.Addr
-	ExchangedVersion bool
-	LastServed       time.Time
-	Utils            *Utils.Utils
-	server           *Server
-	IsInBound        bool
-	SentBytes        uint16
-	RecievedBytes    uint16
-	Timer            *Timer
-	Latency          time.Duration
+	Id            int
+	conn          net.Conn
+	done          chan struct{}
+	VSend         chan []byte
+	Addr          net.Addr
+	stateMu       sync.RWMutex // guards state
+	state         PeerState
+	LastServed    time.Time
+	Utils         *Utils.Utils
+	server        *Server
+	IsInBound     bool
+	SentBytes     uint16
+	RecievedBytes uint16
+	Timer         *Timer
+	Latency       time.Duration
 }
 
 func (cn *CNode) Close() {
@@ -341,23 +371,38 @@ func (cn *CNode) Close() {
 	close(cn.VSend)
 	cn.conn.Close()
 }
+
+// SetState transitions the peer to a new state (thread-safe).
+func (cn *CNode) SetState(ps PeerState) {
+	cn.stateMu.Lock()
+	defer cn.stateMu.Unlock()
+	cn.state = ps
+}
+
+// GetState reads the peer's current state (thread-safe).
+func (cn *CNode) GetState() PeerState {
+	cn.stateMu.RLock()
+	defer cn.stateMu.RUnlock()
+	return cn.state
+}
+
 func NewCNode(server *Server) CNode {
 	VSend := make(chan []byte)
 	return CNode{
-		Id:               GenerateRandomId(),
-		conn:             &net.TCPConn{},
-		VSend:            VSend,
-		ExchangedVersion: false,
-		Addr:             &net.TCPAddr{},
-		done:             make(chan struct{}),
-		LastServed:       time.Time{},
-		Utils:            &Utils.Utils{},
-		server:           server,
-		RecievedBytes:    0,
-		SentBytes:        0,
-		IsInBound:        false,
-		Timer:            NewTimer(),
-		Latency:          0,
+		Id:            GenerateRandomId(),
+		conn:          &net.TCPConn{},
+		VSend:         VSend,
+		state:         StateNegotiating,
+		Addr:          &net.TCPAddr{},
+		done:          make(chan struct{}),
+		LastServed:    time.Time{},
+		Utils:         &Utils.Utils{},
+		server:        server,
+		RecievedBytes: 0,
+		SentBytes:     0,
+		IsInBound:     false,
+		Timer:         NewTimer(),
+		Latency:       0,
 	}
 }
 
@@ -643,7 +688,7 @@ func (cn *CNode) SendVerack(height int) error {
 		cn.RequestBlocks()
 	}
 
-	cn.ExchangedVersion = true
+	cn.SetState(StateReady)
 
 	return nil
 }
@@ -667,7 +712,7 @@ func (cn *CNode) SendVersionMessage() error {
 	log.Printf("Sending Version message to %s", cn.conn.RemoteAddr())
 	//!New message protocol
 	//*[Version | Cammand | Length | Data ]
-	if !cn.ExchangedVersion {
+	if cn.GetState() == StateNegotiating {
 		var data = NewVersionMessage()
 		var buff bytes.Buffer
 		currentBlockHeight, GetHighterr := cn.server.DBMan.GetBlockHeight()
@@ -793,25 +838,37 @@ func (cn *CNode) handler() {
 		}
 
 		cn.Addr = cn.conn.RemoteAddr()
-		if msg.Cammand == byte(VERSION) {
+
+		// Drop protocol messages from peers that haven't completed the
+		// version handshake. Without this, any bytes sent before VERSION/
+		// VERACK exchange get interpreted as protocol messages — a classic
+		// pre-handshake attack surface Bitcoin Core also guards against.
+		cmd := msg.Cammand
+		if cn.GetState() != StateReady &&
+			cmd != byte(VERSION) && cmd != byte(VERACK) && cmd != byte(PING) && cmd != byte(PONG) {
+			log.Printf("Dropping %d from %s: handshake not complete (state: %s)", cmd, cn.Addr, cn.GetState())
+			continue
+		}
+
+		if cmd == byte(VERSION) {
 			var buff VersionMessage
 
 			decoder := gob.NewDecoder(bytes.NewReader(msg.Data))
 			decoder.Decode(&buff)
 
-			if !cn.ExchangedVersion {
+			if cn.GetState() == StateNegotiating {
 				if err := cn.SendVerack(int(buff.StartHeight)); err != nil {
 					errMessage := fmt.Sprintf("Error sending version ackowledgement message to peer %v", cn.conn.RemoteAddr())
 					cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
 				}
 
 			}
-		} else if msg.Cammand == byte(VERACK) {
+		} else if cmd == byte(VERACK) {
 			fmt.Printf("The Verack \n")
-			if !cn.ExchangedVersion {
+			if cn.GetState() == StateNegotiating {
 				cn.Addr = cn.conn.RemoteAddr()
 			}
-		} else if msg.Cammand == byte(GETBLOCKS) {
+		} else if cmd == byte(GETBLOCKS) {
 			blocks, err := cn.server.DBMan.FromNToLatestHash(string(msg.Data))
 
 			if err != nil {

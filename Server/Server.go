@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"math/big"
 	"math/rand"
 	"net"
@@ -484,7 +483,9 @@ func (s *Server) Run() {
 
 				go newNode.PingHandler(uint8(s.PingingDuration))
 			} else {
-				if evited, evictionError := s.AttemptToEvictConnection(); evited && evictionError == nil {
+				if evicted, evictionError := s.EvictOldestInboundPeer(); evictionError == nil && evicted {
+					// A victim was disconnected and removed from the table;
+					// its slot is now genuinely free.
 					newNode := NewCNode(s)
 					newNode.conn = conn
 					newNode.IsInBound = true
@@ -497,8 +498,16 @@ func (s *Server) Run() {
 
 					go newNode.write()
 					go newNode.handler()
-				} else if evictionError != nil {
-					s.ErrorChan <- *NewServerError(ErrorNetwork, "Error accepting connection:", evictionError)
+				} else {
+					// Table full and nothing evictable: refuse the
+					// connection. Previously the peer was appended anyway
+					// (maxPeerLimit was advisory) or the socket was left
+					// open with no goroutines serving it.
+					if evictionError != nil {
+						s.ErrorChan <- *NewServerError(ErrorNetwork, "Error during eviction:", evictionError)
+					}
+					log.Printf("Peer limit reached, refusing connection from %s", conn.RemoteAddr())
+					conn.Close()
 				}
 			}
 
@@ -592,49 +601,57 @@ func decodeMessage(reader io.Reader) (Message, error) {
 	fmt.Printf("Decoded Command: %d\n", msg.Cammand)
 	return msg, nil
 }
-func (s *Server) AttemptToEvictConnection() (bool, error) {
-	s.peersMu.RLock()
-	defer s.peersMu.RUnlock()
 
-	var totalLatency time.Duration
-	var inboundPeers int
+// EvictOldestInboundPeer frees a slot when the peer table is full by
+// disconnecting the inbound peer we've heard from the LEAST recently.
+//
+// Why recency instead of latency statistics: LastServed is updated on
+// every message, needs no warm-up, works from the first byte, and is
+// robust to garbage data. A silent peer is dead, idle, or an attacker
+// holding a slot open — recency handles all three identically. Mean+2σ
+// outlier detection was tried here before and abandoned: latency data
+// was mostly zeros, and with N<5 peers the statistics amplified noise
+// instead of finding outliers. (If you ever want statistical eviction
+// again, use median+MAD, not mean+σ — means hide the outlier they're
+// hunting.)
+//
+// It ACTUALLY disconnects and removes the victim, so the caller may
+// admit a new peer afterwards. Outbound peers are never evicted — we
+// dialed those on purpose; only inbound connections are fair game
+// (this is also Bitcoin Core's policy and basic eclipse-attack hygiene:
+// an attacker flooding inbound connections evicts their own kind).
+func (s *Server) EvictOldestInboundPeer() (bool, error) {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
 
-	for _, peer := range s.peers {
-		if peer.IsInBound {
-			totalLatency += peer.Latency
-			inboundPeers++
+	var victim *CNode
+	var victimIdx int
+	for i, peer := range s.peers {
+		if !peer.IsInBound {
+			continue
+		}
+		// Skip already-closed peers.
+		select {
+		case <-peer.done:
+			continue
+		default:
+		}
+		if victim == nil || peer.LastServed.Before(victim.LastServed) {
+			victim = peer
+			victimIdx = i
 		}
 	}
 
-	if inboundPeers == 0 {
+	if victim == nil {
+		// No evictable inbound peer (maybe zero inbound peers, all closed).
 		return false, nil
 	}
 
-	avg := totalLatency / time.Duration(inboundPeers)
-	fmt.Println("Average Latency:", avg)
-
-	var sumOfSquaredDifferences float64
-	for _, peer := range s.peers {
-		if peer.IsInBound {
-			latencyDiff := float64(peer.Latency - avg)
-			sumOfSquaredDifferences += latencyDiff * latencyDiff
-		}
-	}
-
-	variance := sumOfSquaredDifferences / float64(inboundPeers)
-	stdDeviation := time.Duration(math.Sqrt(variance))
-	fmt.Println("Standard Deviation:", stdDeviation)
-
-	evictionThreshold := avg + 2*stdDeviation
-	fmt.Println("Eviction Threshold:", evictionThreshold)
-
-	var PeersUnderEvictionThreshold []*CNode
-	for _, peer := range s.peers {
-		if peer.IsInBound && peer.Latency < evictionThreshold {
-			PeersUnderEvictionThreshold = append(PeersUnderEvictionThreshold, peer)
-		}
-	}
-	return len(PeersUnderEvictionThreshold) != len(s.peers), nil
+	log.Printf("Evicting inbound peer %s (id %d, silent since %s)",
+		victim.Addr, victim.Id, victim.LastServed.Format(time.RFC3339))
+	victim.Close()
+	s.peers = append(s.peers[:victimIdx], s.peers[victimIdx+1:]...)
+	return true, nil
 }
 
 func (cn *CNode) SendVerack(height int) error {
@@ -831,6 +848,10 @@ func (cn *CNode) handler() {
 			fmt.Printf("The Verack \n")
 			if cn.GetState() == StateNegotiating {
 				cn.Addr = cn.conn.RemoteAddr()
+				// Track recency for eviction: a peer that hasn't sent us ANYTHING
+				// in a long time is the prime eviction candidate (dead, idle, or
+				// an attacker holding a slot open — all handled the same way).
+				cn.LastServed = time.Now()
 			}
 		} else if cmd == byte(GETBLOCKS) {
 			blocks, err := cn.server.DBMan.FromNToLatestHash(string(msg.Data))

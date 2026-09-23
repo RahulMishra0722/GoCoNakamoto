@@ -19,7 +19,8 @@ import (
 	"github.com/RahulMishra0722/GC/DBMan"
 	MinerCacheMan "github.com/RahulMishra0722/GC/MinerCasheMan"
 
-	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/btcec/v2"
+	v2ecdsa "github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"go.uber.org/zap/buffer"
 )
 
@@ -104,7 +105,7 @@ func (m *Miner) CreateCoinbaseTransaction(totalFee int64) (DBMan.Transaction, er
 // lists produced different roots, so blocks were unvalidatable by design.
 
 func GenerateKeys() (string, string, error) {
-	privateKey, err := btcec.NewPrivateKey(btcec.S256())
+	privateKey, err := btcec.NewPrivateKey()
 	if err != nil {
 		return "", "", err
 	}
@@ -147,7 +148,7 @@ func ValidateSignature(pubKeyString string, transactionHash string, signatureHex
 		return false, fmt.Errorf("error decoding public key: %v", err)
 	}
 
-	pubkey, err := btcec.ParsePubKey(pubKeyBytes, btcec.S256())
+	pubkey, err := btcec.ParsePubKey(pubKeyBytes)
 	if err != nil {
 		return false, fmt.Errorf("error parsing public key: %v", err)
 	}
@@ -157,7 +158,7 @@ func ValidateSignature(pubKeyString string, transactionHash string, signatureHex
 		return false, fmt.Errorf("error decoding signature: %v", err)
 	}
 
-	signature, err := btcec.ParseDERSignature(signatureBytes, btcec.S256())
+	signature, err := v2ecdsa.ParseDERSignature(signatureBytes)
 	if err != nil {
 		return false, fmt.Errorf("error parsing signature: %v", err)
 	}

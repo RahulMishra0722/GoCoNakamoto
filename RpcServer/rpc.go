@@ -11,7 +11,8 @@ import (
 
 	"github.com/RahulMishra0722/GC/DBMan"
 	"github.com/RahulMishra0722/GC/Server"
-	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/btcec/v2"
+	v2ecdsa "github.com/btcsuite/btcd/btcec/v2/ecdsa"
 )
 
 type RpcServer struct {
@@ -27,7 +28,7 @@ func ValidateSignature(pubKeyString string, transactionHash string, signatureHex
 		return false, fmt.Errorf("error decoding public key: %v", err)
 	}
 
-	pubkey, err := btcec.ParsePubKey(pubKeyBytes, btcec.S256())
+	pubkey, err := btcec.ParsePubKey(pubKeyBytes)
 	if err != nil {
 		return false, fmt.Errorf("error parsing public key: %v", err)
 	}
@@ -37,7 +38,7 @@ func ValidateSignature(pubKeyString string, transactionHash string, signatureHex
 		return false, fmt.Errorf("error decoding signature: %v", err)
 	}
 
-	signature, err := btcec.ParseDERSignature(signatureBytes, btcec.S256())
+	signature, err := v2ecdsa.ParseDERSignature(signatureBytes)
 	if err != nil {
 		return false, fmt.Errorf("error parsing signature: %v", err)
 	}

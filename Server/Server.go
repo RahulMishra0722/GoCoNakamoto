@@ -329,7 +329,6 @@ type CNode struct {
 	LastServed       time.Time
 	Utils            *Utils.Utils
 	server           *Server
-	block            bool
 	IsInBound        bool
 	SentBytes        uint16
 	RecievedBytes    uint16
@@ -354,7 +353,6 @@ func NewCNode(server *Server) CNode {
 		LastServed:       time.Time{},
 		Utils:            &Utils.Utils{},
 		server:           server,
-		block:            false,
 		RecievedBytes:    0,
 		SentBytes:        0,
 		IsInBound:        false,
@@ -866,21 +864,19 @@ func (cn *CNode) handler() {
 			}
 
 		} else if msg.Cammand == byte(BLOCK) {
-			if !cn.block {
-				gob.Register(&DBMan.Block{})
+			gob.Register(&DBMan.Block{})
 
-				var block DBMan.Block
-				var buff bytes.Buffer
-				buff.Write(msg.Data)
+			var block DBMan.Block
+			var buff bytes.Buffer
+			buff.Write(msg.Data)
 
-				err := gob.NewDecoder(&buff).Decode(&block)
-				if err != nil {
-					cn.server.ErrorChan <- *NewServerError(ErrorInternal, "Error decoding Block", err)
-				} else {
-					cn.server.ProcessAndStoreNewMinedBlock(block)
-				}
-
+			err := gob.NewDecoder(&buff).Decode(&block)
+			if err != nil {
+				cn.server.ErrorChan <- *NewServerError(ErrorInternal, "Error decoding Block", err)
+			} else {
+				cn.server.ProcessAndStoreNewMinedBlock(block)
 			}
+
 		} else if msg.Cammand == byte(HEADERS) {
 			var hashes []string
 			decoder := gob.NewDecoder(bytes.NewReader(msg.Data))
@@ -1118,7 +1114,6 @@ func (s *Server) BroadCasteBlock(block *DBMan.Block) error {
 	defer s.peersMu.RUnlock()
 	for _, peer := range s.peers {
 		peer.VSend <- encodedBlock
-		peer.block = true
 	}
 	return nil
 }

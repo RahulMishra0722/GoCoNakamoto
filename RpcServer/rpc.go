@@ -132,15 +132,22 @@ func (rpc *RpcServer) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := reqOuter.Transaction
-	// log.Printf("SendTransaction: Received transaction: %+v", req)
-	if valid, err := ValidateSignature(req.Sender, req.TxnHash, req.Signature); !valid && err == nil {
+	valid, sigErr := ValidateSignature(req.Sender, req.TxnHash, req.Signature)
+	if sigErr != nil || !valid {
 		response := map[string]interface{}{
 			"Response": "Invalid Signature transaction is being rejected",
 		}
 		w.WriteHeader(http.StatusNotAcceptable)
 		json.NewEncoder(w).Encode(response)
+		return
 	}
-	rpc.Connman.DBMan.AddToMempool(req.TxnHash, req)
+	if err := rpc.Connman.DBMan.AddToMempool(req.TxnHash, req); err != nil {
+		http.Error(w, fmt.Sprintf("transaction rejected: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := rpc.Connman.RelayToKnowPeers(req); err != nil {
+		log.Printf("SendTransaction: failed to relay txn %s to peers: %v", req.TxnHash, err)
+	}
 	response := map[string]interface{}{
 		"Response": "We Have Recived Your Transaction wait till The Node will verifies your transaction",
 	}
@@ -167,11 +174,13 @@ func (rpc *RpcServer) SubmitBlock(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "error reading request body", http.StatusBadRequest)
+		return
 	}
 	var reqBlock DBMan.Block
 
 	if err := json.Unmarshal(body, &reqBlock); err != nil {
 		http.Error(w, "error unmarshaling json", http.StatusBadRequest)
+		return
 	}
 	ok, err := rpc.Connman.ProcessAndStoreNewMinedBlock(reqBlock)
 
@@ -182,9 +191,9 @@ func (rpc *RpcServer) SubmitBlock(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		fmt.Print(err)
-		http.Error(w, "Error storing block %w", http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Error storing block: %v", err), http.StatusInternalServerError)
+		return
 	}
-
 	if ok {
 		fmt.Printf("Block Stored Successfully \n")
 	}
@@ -208,7 +217,8 @@ func (rpc *RpcServer) GetBlockTemplate(w http.ResponseWriter, r *http.Request) {
 		//Todo
 		//* 1) init func to create all the buckets and one to shove a genesis block so we never run into getting error on get PrevHash
 		//* 20 change the code so its now compatible with http as in new format
-		json.NewEncoder(w).Encode("Error occured Trying to generate block template")
+		http.Error(w, "Error occured Trying to generate block template", http.StatusInternalServerError)
+		return
 	}
 
 	errrr := json.NewEncoder(w).Encode(template)

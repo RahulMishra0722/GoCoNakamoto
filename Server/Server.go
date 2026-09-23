@@ -1219,6 +1219,14 @@ func (s *Server) StoreInMempoolAndRelay(ctx context.Context, transaction DBMan.T
 		return err, false
 	}
 	log.Printf("StoreInMempoolAndRelay: Transaction verified. Added: %v", added)
+
+	// Relay newly-accepted transactions so peers hear the INV and pull the
+	// full txn with GETDATA. Without this the mempool never propagates.
+	if added {
+		if relayErr := s.RelayToKnowPeers(transaction); relayErr != nil {
+			log.Printf("StoreInMempoolAndRelay: failed to relay txn %s: %v", transaction.TxnHash, relayErr)
+		}
+	}
 	return nil, added
 }
 func (s *Server) LogPeers() {

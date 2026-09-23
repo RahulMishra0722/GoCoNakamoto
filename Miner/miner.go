@@ -32,6 +32,7 @@ type Miner struct {
 // Todo[] One more feature in wallet currently we clear the whole thing and that looses the public key and that will cause the user to enter public key every transaction
 // Todo[] what would be really fun is a retry function it'll figure out if we should retry and will if we have to given the right conitions
 const (
+	// Subsidy is in whole coins; multiply by DBMan.SatoshisPerCoin when used.
 	Subsidy    = 50 // will get halved every 250000 blocks
 	CurVersion = 0.1
 )
@@ -46,7 +47,7 @@ func doubleSHA256(data []byte) string {
 
 // }
 
-func (m *Miner) CreateCoinbaseTransaction(totalFee float64) (DBMan.Transaction, error) {
+func (m *Miner) CreateCoinbaseTransaction(totalFee int64) (DBMan.Transaction, error) {
 	_, publicKey, err := GenerateKeys()
 	if err != nil {
 		fmt.Printf("Error Generating Keys CoinBase %s", err)
@@ -56,11 +57,11 @@ func (m *Miner) CreateCoinbaseTransaction(totalFee float64) (DBMan.Transaction, 
 		TxnHash:    "", //Make a txn hasing function
 		Inputs:     []DBMan.Utxo{},
 		Outputs:    []DBMan.Utxo{},
-		Subsidy:    50,
+		Subsidy:    Subsidy * DBMan.SatoshisPerCoin,
 		Sender:     "",
 		Receiver:   publicKey,
 		LockTime:   0,
-		Fee:        0.00,
+		Fee:        0,
 		IsCoinbase: true,
 		Height:     0, //* Mental note get the prev_hash from db and with that get block number and based on that +1 this
 	}
@@ -70,7 +71,7 @@ func (m *Miner) CreateCoinbaseTransaction(totalFee float64) (DBMan.Transaction, 
 	}
 
 	output := DBMan.TxOutput{
-		Value:        Subsidy + totalFee,
+		Value:        Subsidy*DBMan.SatoshisPerCoin + totalFee,
 		ScriptPubKey: publicKey,
 	}
 	outPoint := DBMan.OutPoint{
@@ -256,7 +257,7 @@ type Template struct {
 func (m *Miner) NewBlock() (*DBMan.Block, error) {
 	fmt.Println("Mining starts")
 	var successFullyMinedTransactions []DBMan.Transaction
-	var totalFee float64
+	var totalFee int64
 	template, err := m.casheMan.GetBlockTemplate()
 	if err != nil {
 		return &DBMan.Block{}, fmt.Errorf("error getting block template: %w", err)
@@ -272,7 +273,7 @@ func (m *Miner) NewBlock() (*DBMan.Block, error) {
 		//Todo check if the utxo's even exist
 		if isValid {
 
-			var totalValue float64
+			var totalValue int64
 			for _, tx := range txn.Inputs {
 				totalValue += tx.Output.Value
 			}
@@ -526,7 +527,7 @@ func main() {
 	for i := 0; i < 1; i++ {
 		for _, txn := range block.Transactions {
 			for _, opt := range txn.Outputs {
-				fmt.Printf("Utxo value %f", opt.Output.Value)
+				fmt.Printf("Utxo value %d", opt.Output.Value)
 			}
 		}
 	}

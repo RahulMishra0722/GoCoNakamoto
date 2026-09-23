@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"sort"
 	"sync"
 
@@ -51,20 +50,24 @@ type BlockHeader struct {
 }
 
 type Transaction struct {
-	BlockHash  string  //Block Hash what block this transaction was formed in
-	TxnHash    string  // Transaction hash
-	Sender     string  // Sender's public key (not used in coinbase)
-	Receiver   string  // Coinbase transactions for rewarding miner
-	Signature  string  // Signature of the transaction
-	Amount     float64 // Total amount in the transaction (used for non-coinbase transactions)
-	Inputs     []Utxo  // Inputs for the transaction
-	Outputs    []Utxo  // Outputs for the transaction
-	LockTime   uint32  // Lock time for the transaction
-	IsCoinbase bool    // Indicates if the transaction is a coinbase transaction
-	Height     uint32  // Block height for the coinbase transaction
-	Subsidy    float64 // Mining subsidy amount for the coinbase transaction
-	Fee        float64
+	BlockHash  string //Block Hash what block this transaction was formed in
+	TxnHash    string // Transaction hash
+	Sender     string // Sender's public key (not used in coinbase)
+	Receiver   string // Coinbase transactions for rewarding miner
+	Signature  string // Signature of the transaction
+	Amount     int64  // Total amount, in satoshis (1 GXC = 100,000,000 satoshis) — never floats
+	Inputs     []Utxo // Inputs for the transaction
+	Outputs    []Utxo // Outputs for the transaction
+	LockTime   uint32 // Lock time for the transaction
+	IsCoinbase bool   // Indicates if the transaction is a coinbase transaction
+	Height     uint32 // Block height for the coinbase transaction
+	Subsidy    int64  // Mining subsidy, in satoshis
+	Fee        int64
 }
+
+// SatoshisPerCoin: the smallest unit is the satoshi; 1 GXC = 100,000,000 satoshis.
+// All monetary amounts anywhere in the codebase are satoshis (int64).
+const SatoshisPerCoin int64 = 100_000_000
 
 type BlockTemplate struct {
 	PrevBlockHash string        `json:"previousBlockHash"`
@@ -83,7 +86,7 @@ type OutPoint struct {
 }
 
 type TxInput struct {
-	Value          float64
+	Value          int64
 	PreviousOutput OutPoint
 	Publickey      ecdsa.PublicKey
 }
@@ -94,8 +97,8 @@ type Utxo struct {
 }
 
 type TxOutput struct {
-	Value        float64 // Amount in satoshis (1 BTC = 100,000,000 satoshis) well  wont take this route of manging floats it gets trick very fast
-	ScriptPubKey string  // Locking script, setting conditions to spend this output (e.g., requires a signature)
+	Value        int64  // Amount in satoshis (1 GXC = 100,000,000 satoshis). Integers only — floats lose precision and make equality/arithmetic unreliable.
+	ScriptPubKey string // Locking script, setting conditions to spend this output (e.g., requires a signature)
 }
 type Blocks []Block
 type Block struct {
@@ -214,7 +217,7 @@ func (dm *DBman) GenerateGenesisBlock() (*Block, Transaction, error) {
 		Sender:    "",
 		Receiver:  genesisMinerPubkey,
 		Signature: "",
-		Amount:    50.0,
+		Amount:    50 * SatoshisPerCoin,
 		Inputs:    []Utxo{},
 		Outputs: []Utxo{
 			{
@@ -224,7 +227,7 @@ func (dm *DBman) GenerateGenesisBlock() (*Block, Transaction, error) {
 					Index: 0,
 				},
 				Output: TxOutput{
-					Value:        50.0,
+					Value:        50 * SatoshisPerCoin,
 					ScriptPubKey: "020eb83857e3e0778ca6377b1fa171cf6e5f36ce0de59c72874e96086b99c32048",
 				},
 			},
@@ -232,7 +235,7 @@ func (dm *DBman) GenerateGenesisBlock() (*Block, Transaction, error) {
 		LockTime:   0,
 		IsCoinbase: true,
 		Height:     1,
-		Subsidy:    50.0,
+		Subsidy:    50 * SatoshisPerCoin,
 		Fee:        0,
 	}
 	header := BlockHeader{
@@ -323,7 +326,10 @@ func CalculateBlockHash(header BlockHeader) string {
 }
 
 func CalculateTransactionHash(tx Transaction) string {
-	txBytes := []byte(fmt.Sprintf("%s%s%s%f%d%d%f%f",
+	// Amount/Subsidy are int64 satoshis and hash as %d. NOTE: this changes
+	// the txn hash format — the wallet repo must use the same format when
+	// signing (it signs over this hash).
+	txBytes := []byte(fmt.Sprintf("%s%s%s%d%d%d%d%d",
 		tx.Sender,
 		tx.Receiver,
 		tx.Signature,
@@ -388,9 +394,9 @@ func (tx *Transaction) CalculateHash() string {
 
 	data := tx.BlockHash + tx.TxnHash + string(tx.Sender) + string(tx.Receiver) + tx.Signature
 
-	// Serialize Amount
+	// Serialize Amount (satoshis, int64)
 	amountBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(amountBytes, math.Float64bits(tx.Amount))
+	binary.LittleEndian.PutUint64(amountBytes, uint64(tx.Amount))
 	data += string(amountBytes)
 
 	// Serialize LockTime
@@ -410,9 +416,9 @@ func (tx *Transaction) CalculateHash() string {
 	binary.LittleEndian.PutUint32(heightBytes, tx.Height)
 	data += string(heightBytes)
 
-	// Serialize Subsidy
+	// Serialize Subsidy (satoshis, int64)
 	subsidyBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(subsidyBytes, math.Float64bits(tx.Subsidy))
+	binary.LittleEndian.PutUint64(subsidyBytes, uint64(tx.Subsidy))
 	data += string(subsidyBytes)
 
 	// Create a SHA-256 hash of the serialized data
@@ -494,7 +500,7 @@ func (dm *DBman) VerifyTransaction(ctx context.Context, transaction Transaction)
 				return fmt.Errorf("UTXO bucket not initialized")
 			}
 
-			var total float64
+			var total int64
 			for _, utxo := range transaction.Inputs {
 				select {
 				case <-ctx.Done():
@@ -518,7 +524,7 @@ func (dm *DBman) VerifyTransaction(ctx context.Context, transaction Transaction)
 				}
 			}
 
-			log.Printf("VerifyTransaction: Total UTXO value: %f, Transaction amount: %f", total, transaction.Amount)
+			log.Printf("VerifyTransaction: Total UTXO value: %d, Transaction amount: %d", total, transaction.Amount)
 			if total < transaction.Amount {
 
 				log.Printf("VerifyTransaction: Insufficient balance for transaction %s", transaction.TxnHash)
@@ -1328,11 +1334,11 @@ func (dm *DBman) Close() {
 		dm.db.Close()
 	}
 }
-func (dm *DBman) GetBalance(pubkey string) (float64, []Utxo, error) {
+func (dm *DBman) GetBalance(pubkey string) (int64, []Utxo, error) {
 
 	dm.rwMu.Lock()
 	defer dm.rwMu.Unlock()
-	var balance float64
+	var balance int64
 	var utxos []Utxo
 	err := dm.db.View(func(tx *bbolt.Tx) error {
 		bucketName := []byte("UTXO")

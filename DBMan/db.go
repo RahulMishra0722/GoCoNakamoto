@@ -13,7 +13,6 @@ import (
 	"log"
 	"math"
 	"sort"
-	"strings"
 	"sync"
 
 	"go.etcd.io/bbolt"
@@ -245,16 +244,22 @@ func (dm *DBman) GenerateGenesisBlock() (*Block, Transaction, error) {
 		Nonce:         0,
 	}
 
+	// ORDERING RULE (same as the miner fix): the coinbase's TxnHash must
+	// be computed BEFORE the merkle root, which must be computed BEFORE
+	// the block hash. Previously the root was taken over a transaction
+	// whose TxnHash was still "" and the txn hash was assigned afterwards.
+	// NOTE: this changes the genesis hash — existing local DBs must be
+	// deleted (MainServer.db) or the new genesis will be rejected as a
+	// non-extending block.
+	txHash := CalculateTransactionHash(coinbaseTx)
+	coinbaseTx.TxnHash = txHash
+
 	block := &Block{
 		Height:       1,
 		Header:       header,
 		Hash:         "",
 		Transactions: []Transaction{coinbaseTx},
 	}
-	// // Blockerr := dm.SetBlockHeight()
-	// if Blockerr != nil {
-	// 	return &Block{}, Transaction{}, fmt.Errorf("error Storing block height %w", Blockerr)
-	// }
 
 	merkleRoot := CalculateMerkleRoot(block.Transactions)
 	block.Header.MerkleRoot = merkleRoot
@@ -264,9 +269,6 @@ func (dm *DBman) GenerateGenesisBlock() (*Block, Transaction, error) {
 	block.Hash = blockHash
 
 	block.Transactions[0].BlockHash = blockHash
-
-	txHash := CalculateTransactionHash(block.Transactions[0])
-	block.Transactions[0].TxnHash = txHash
 
 	return block, coinbaseTx, nil
 }
@@ -566,61 +568,61 @@ func (dm *DBman) VerifyTransaction(ctx context.Context, transaction Transaction)
 	log.Printf("VerifyTransaction: Transaction %s verified successfully", transaction.TxnHash)
 	return successfullyAdded, nil
 }
+
+// AddToMempool atomically validates and inserts a transaction:
+//  1. every input must exist in the UTXO set
+//  2. no input may already be spent by another transaction in the mempool
+//  3. insert
+//
+// All three steps run inside ONE bbolt write transaction so two concurrent
+// transactions spending the same UTXO cannot both pass the check — the write
+// lock serializes them, and the second one sees the first's insert.
 func (dm *DBman) AddToMempool(hash string, txn Transaction) error {
 	dm.rwMu.Lock()
 	defer dm.rwMu.Unlock()
 
-	valid, err := dm.AreInputsValid(txn.Inputs)
-	if err != nil {
-		return fmt.Errorf("validating inputs: %w", err)
-	}
-	if !valid {
-		return fmt.Errorf("transaction rejected due to invalid inputs")
-	}
-
 	return dm.db.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte("MemPoolTransactions"))
-		if bucket == nil {
+		utxoBucket := tx.Bucket([]byte("UTXO"))
+		if utxoBucket == nil {
+			return fmt.Errorf("bucket UTXO does not exist")
+		}
+		mempool := tx.Bucket([]byte("MemPoolTransactions"))
+		if mempool == nil {
 			return fmt.Errorf("bucket MemPoolTransactions does not exist")
 		}
+
+		// 1. inputs must exist in the UTXO set
+		inputSet := make(map[string]bool, len(txn.Inputs))
+		for _, utxo := range txn.Inputs {
+			if utxoBucket.Get([]byte(utxo.Id)) == nil {
+				return fmt.Errorf("invalid input: UTXO %s does not exist", utxo.Id)
+			}
+			inputSet[utxo.Id] = true
+		}
+
+		// 2. inputs must not already be spent by a mempool transaction
+		//    (double spend). UTXOs are only deleted when a block is mined,
+		//    so the UTXO set alone can't detect this.
+		cursor := mempool.Cursor()
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			var pending Transaction
+			if err := json.Unmarshal(v, &pending); err != nil {
+				return fmt.Errorf("failed to deserialize mempool txn %s: %w", string(k), err)
+			}
+			for _, spent := range pending.Inputs {
+				if inputSet[spent.Id] {
+					return fmt.Errorf("double spend rejected: UTXO %s already spent by mempool txn %s", spent.Id, pending.TxnHash)
+				}
+			}
+		}
+
+		// 3. insert
 		serialized, err := json.Marshal(txn)
 		if err != nil {
 			return fmt.Errorf("serialize transaction: %w", err)
 		}
-		key := []byte(hash)
-		return bucket.Put(key, serialized)
+		return mempool.Put([]byte(hash), serialized)
 	})
-}
-
-// * I know it could be done by utxo function i dont wanna edit the older function and make it incompatible for other related function
-
-func (dm *DBman) AreInputsValid(inputs []Utxo) (bool, error) {
-	var invalidInputs []string
-
-	err := dm.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte("UTXO"))
-		if bucket == nil {
-			return fmt.Errorf("UTXO bucket does not exist; this indicates a serious database initialization problem")
-		}
-
-		for _, utxo := range inputs {
-			if data := bucket.Get([]byte(utxo.Id)); data == nil {
-				invalidInputs = append(invalidInputs, utxo.Id)
-			}
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return false, fmt.Errorf("database error while validating inputs: %w", err)
-	}
-
-	if len(invalidInputs) > 0 {
-		return false, fmt.Errorf("invalid inputs found: %s", strings.Join(invalidInputs, ", "))
-	}
-
-	return true, nil
 }
 func (dm *DBman) GetMempoolTxns() ([]Transaction, error) {
 
@@ -807,6 +809,26 @@ func (dm *DBman) StoreBlock(block Block) error {
 	if exists {
 		return nil
 	}
+
+	// Chain-tip protection: a block may only be appended if it explicitly
+	// extends the current tip. Without this, ANY peer could send any valid-
+	// PoW block and this node would store it AND repoint prev_hash at it —
+	// a remote chain-tip hijack. Blocks that don't extend the tip are
+	// rejected as orphans (fork/reorg handling is future work: competing
+	// forks at the same height are simply not followed).
+	tipHash, tipErr := dm.GetPrevHash()
+	if tipErr == nil && tipHash != "" {
+		if block.Header.PrevBlockHash != tipHash {
+			return fmt.Errorf("rejected block %s: prev hash %s does not extend current tip %s (orphan/fork)",
+				block.Hash, block.Header.PrevBlockHash, tipHash)
+		}
+		tipHeight, heightErr := dm.GetBlockHeight()
+		if heightErr == nil && block.Height != tipHeight+1 {
+			return fmt.Errorf("rejected block %s: height %d does not follow tip height %d",
+				block.Hash, block.Height, tipHeight)
+		}
+	}
+	// tipErr != nil means no tip exists yet (fresh DB) — allow genesis bootstrap.
 
 	var buffer bytes.Buffer
 	encoder := gob.NewEncoder(&buffer)

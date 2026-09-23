@@ -373,8 +373,23 @@ type CNode struct {
 
 func (cn *CNode) Close() {
 	close(cn.done)
-	close(cn.VSend)
+	// NOTE: cn.VSend is deliberately NOT closed here. Other goroutines may
+	// still be blocked sending to it; closing a channel with pending
+	// senders panics ("send on closed channel"). write() exits via the
+	// done channel instead, and senders use Enqueue() which also selects
+	// on done, so nothing blocks forever after Close.
 	cn.conn.Close()
+}
+
+// Enqueue queues a message for this peer without ever panicking: if the
+// peer was closed, the send is dropped instead of blocking forever.
+func (cn *CNode) Enqueue(data []byte) bool {
+	select {
+	case cn.VSend <- data:
+		return true
+	case <-cn.done:
+		return false
+	}
 }
 
 // SetState transitions the peer to a new state (thread-safe).
@@ -458,6 +473,11 @@ func New(config *Config) *Server {
 		}
 	}()
 
+	// Exactly ONE retry handler for the whole server. It used to be
+	// spawned per accepted connection — N copies competing on one channel,
+	// each sleeping 10s inside the loop and serializing all retries.
+	go s.SendRetryHandler()
+
 	return s
 }
 
@@ -508,7 +528,6 @@ func (s *Server) Run() {
 				go newNode.handler()
 
 				go newNode.PingHandler(uint8(s.PingingDuration))
-				go s.SendRetryHandler()
 			} else {
 				if evited, evictionError := s.AttemptToEvictConnection(); evited && evictionError == nil {
 					newNode := NewCNode(s)
@@ -523,8 +542,6 @@ func (s *Server) Run() {
 
 					go newNode.write()
 					go newNode.handler()
-
-					go s.SendRetryHandler()
 				} else if evictionError != nil {
 					s.ErrorChan <- *NewServerError(ErrorNetwork, "Error accepting connection:", evictionError)
 				}
@@ -713,7 +730,7 @@ func (cn *CNode) RequestBlocks() {
 	message.Cammand = byte(GETBLOCKS)
 	message.Data = []byte(hash)
 	encodedRequest := encodeMessage(message)
-	cn.VSend <- encodedRequest
+	cn.Enqueue(encodedRequest)
 
 }
 func (cn *CNode) SendVersionMessage() error {
@@ -820,7 +837,7 @@ func (cn *CNode) OnGetDataReqTX(hash string) error {
 	txnData.Version = 10 // gotta figure out ho to manage this dynamically also on what premise
 	data := encodeMessage(txnData)
 
-	cn.VSend <- data
+	cn.Enqueue(data)
 	return nil
 }
 
@@ -899,7 +916,7 @@ func (cn *CNode) handler() {
 			msg.Length = length
 			encoded := encodeMessage(msg)
 			cn.SentBytes += uint64(length)
-			cn.VSend <- encoded
+			cn.Enqueue(encoded)
 		} else if msg.Cammand == byte(INV) {
 			// * check in db if we already have this txn
 
@@ -1040,7 +1057,7 @@ func (cn *CNode) SendPong() {
 	Pong.Data = []byte{}
 	Pong.Length = 0
 	EncodedPong := encodeMessage(Pong)
-	cn.VSend <- EncodedPong
+	cn.Enqueue(EncodedPong)
 }
 func (cn *CNode) SendPing() {
 	Ping := NewMessage()
@@ -1048,7 +1065,7 @@ func (cn *CNode) SendPing() {
 	Ping.Data = []byte{}
 	Ping.Length = 0
 	EncodedPong := encodeMessage(Ping)
-	cn.VSend <- EncodedPong
+	cn.Enqueue(EncodedPong)
 }
 func (cn *CNode) PrepareAndSendBlocks(blocks []DBMan.Block) error {
 	if blocks == nil {
@@ -1079,11 +1096,8 @@ func (cn *CNode) PrepareAndSendBlocks(blocks []DBMan.Block) error {
 	if cn.VSend == nil {
 		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "send channel is nil", nil)
 	}
-	select {
-	case cn.VSend <- encodedMessage:
-		return nil
-	case <-time.After(5 * time.Second):
-		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("timeout sending blocks to channel"))
+	if !cn.Enqueue(encodedMessage) {
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("peer closed, dropped block message"))
 	}
 	return nil
 
@@ -1106,7 +1120,7 @@ func (cn *CNode) RequestBlocksForGivenHases(hashes []string) {
 
 	// Send the encoded message
 	encodedMessage := encodeMessage(newBlockRequestMessage)
-	cn.VSend <- encodedMessage
+	cn.Enqueue(encodedMessage)
 }
 func (s *Server) IsBlockValid(block *DBMan.BlockHeader) bool {
 
@@ -1193,7 +1207,7 @@ func (s *Server) BroadCasteBlock(block *DBMan.Block) error {
 	s.peersMu.RLock()
 	defer s.peersMu.RUnlock()
 	for _, peer := range s.peers {
-		peer.VSend <- encodedBlock
+		peer.Enqueue(encodedBlock)
 	}
 	return nil
 }
@@ -1206,7 +1220,7 @@ func (cn *CNode) RequestTxn(txn []byte) error {
 	getDataRequest.Length = length
 	encodedGetDataRequest := encodeMessage(getDataRequest)
 
-	cn.VSend <- encodedGetDataRequest
+	cn.Enqueue(encodedGetDataRequest)
 	return nil
 }
 func (s *Server) RelayToKnowPeers(transaction DBMan.Transaction) error {
@@ -1226,7 +1240,7 @@ func (s *Server) RelayToKnowPeers(transaction DBMan.Transaction) error {
 	defer s.peersMu.RUnlock()
 	if len(s.peers) > 0 {
 		for _, peer := range s.peers {
-			peer.VSend <- encoded
+			peer.Enqueue(encoded)
 		}
 	}
 	return nil
@@ -1281,27 +1295,31 @@ func (cn *CNode) write() {
 	log.Printf("Starting write routine for connection to %s", cn.conn.RemoteAddr())
 
 	for {
-		msg, ok := <-cn.VSend
-
-		if !ok {
-			errMessage := fmt.Sprintf("Channel closed for %s, stopping message sending", cn.conn.RemoteAddr()) //* redundant
-			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, fmt.Errorf("channel closed for %s, stopping message sending", cn.conn.RemoteAddr()))
+		select {
+		case <-cn.done:
+			log.Printf("Peer %s closed, stopping message sending", cn.conn.RemoteAddr())
 			return
-		}
+		case msg, ok := <-cn.VSend:
+			if !ok {
+				errMessage := fmt.Sprintf("Channel closed for %s, stopping message sending", cn.conn.RemoteAddr()) //* redundant
+				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, fmt.Errorf("channel closed for %s, stopping message sending", cn.conn.RemoteAddr()))
+				return
+			}
 
-		log.Printf("Writing message of length %d to %s", len(msg), cn.conn.RemoteAddr())
-		_, err := writer.Write(msg)
-		if err != nil {
-			errMessage := fmt.Sprintf("error writing to : %v", cn.conn.RemoteAddr())
-			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
-		}
+			log.Printf("Writing message of length %d to %s", len(msg), cn.conn.RemoteAddr())
+			_, err := writer.Write(msg)
+			if err != nil {
+				errMessage := fmt.Sprintf("error writing to : %v", cn.conn.RemoteAddr())
+				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
+			}
 
-		err = writer.Flush()
-		if err != nil {
-			errMessage := fmt.Sprintf("Error flushing writer for %s: %v", cn.conn.RemoteAddr(), err)
-			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
+			err = writer.Flush()
+			if err != nil {
+				errMessage := fmt.Sprintf("Error flushing writer for %s: %v", cn.conn.RemoteAddr(), err)
+				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, errMessage, err)
+			}
+			log.Printf("Message flushed to %s", cn.conn.RemoteAddr())
 		}
-		log.Printf("Message flushed to %s", cn.conn.RemoteAddr())
 	}
 }
 func (s *Server) ShutDown() {

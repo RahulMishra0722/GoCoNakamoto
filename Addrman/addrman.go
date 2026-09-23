@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"go.etcd.io/bbolt"
 )
@@ -25,8 +26,11 @@ func GetAddrMan(path string) (*Addrman, error) {
 
 	once.Do(func() {
 		options := &bbolt.Options{
-			NoSync:  false,
-			Timeout: 1,
+			NoSync: false,
+			// Wait up to 5s for the file lock if another process holds it.
+			// This was `Timeout: 1` — 1 NANOSECOND — so any momentary
+			// lock contention failed instantly with a timeout error.
+			Timeout: 5 * time.Second,
 		}
 
 		db, err := bbolt.Open(path, 0666, options)

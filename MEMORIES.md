@@ -73,8 +73,14 @@ node. That's how I learned about reverse proxies, leaky buckets,
 sliding windows, and other rate-limiting algorithms.
 
 And as soon as I had them working — doing exactly what they're supposed
-to do — **the magic went away.** That's the pattern: magic is what
-you haven't understood yet.
+to do — **the magic went away.** Here's the rule underneath it all: I
+only code as long as there's a difference between my understanding and
+reality. The moment the system works *and* I understand it, I don't
+want to do it anymore. The fun is in figuring it out; once that's gone,
+it's all boring. It's why I did everything in 1.5 years of starting
+programming — I got things to work for me, and as soon as they worked,
+I moved on. It's why this was never production-ready: I wrote it for
+me, and for my understanding. Not for anyone else's.
 
 I had given myself a deadline before starting my company. Time was
 running out, so as a last thing I made a neural net trained on MNIST
@@ -93,5 +99,8 @@ Renamed before going live with Adverdict, the business I'm building
 with high hopes. If you're reading this from the future: it all started
 with a gopher, a sister's savings, and a guy who dropped out of college
 but never stopped loving this stuff.
+
+This file is just a reminder for me — I know I'm gonna win. Future me:
+look back for the giggles.
 
 — Rahul, 2026

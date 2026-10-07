@@ -441,6 +441,7 @@ func (s *Server) Run() {
 	listener, err := net.Listen("tcp4", s.host+":"+s.port)
 	if err != nil {
 		s.ErrorChan <- *NewServerError(ErrorNetwork, "error starting server Err", err)
+		return
 	}
 	s.listener = listener
 	defer listener.Close()
@@ -556,8 +557,11 @@ func (s *Server) Dial(addr string) bool {
 	return true
 }
 func GenerateRandomId() int {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	return r.Intn(10000) //generates an between 1 - 10000
+	// Top-level math/rand functions are safe for concurrent use and share a
+	// single, randomly-seeded source. Seeding a fresh source with
+	// time.Now().UnixNano() on every call produced identical seeds (and thus
+	// colliding IDs) under fast successive calls.
+	return rand.Intn(10000) //generates an between 1 - 10000
 }
 
 // ! have to shift these to utils
@@ -666,11 +670,12 @@ func (cn *CNode) SendVerack(height int) error {
 		return fmt.Errorf("error occured sending Verack Message: Err:%v", err)
 	}
 	if err := cn.SendVersionMessage(); err != nil {
-		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Sending VersionMessage", err)
+		return fmt.Errorf("error sending VersionMessage: %w", err)
 	}
 	curHeight, err := cn.server.DBMan.GetBlockHeight()
 	if err != nil {
 		cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error getting block height from db", err)
+		return err
 	}
 	fmt.Printf("MainServer Height : %d\n", curHeight)
 
@@ -690,6 +695,7 @@ func (cn *CNode) RequestBlocks() {
 	hash, err := cn.server.DBMan.GetPrevHash()
 	if err != nil {
 		cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error trying to get Prev Hash from DBMan", err)
+		return
 	}
 	length := dataByteLen([]byte(hash))
 	message.Length = length
@@ -709,6 +715,7 @@ func (cn *CNode) SendVersionMessage() error {
 		currentBlockHeight, GetHighterr := cn.server.DBMan.GetBlockHeight()
 		if GetHighterr != nil {
 			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error getting Block Height From DBMan", GetHighterr)
+			return GetHighterr
 		}
 		data.StartHeight = int32(currentBlockHeight)
 
@@ -716,6 +723,7 @@ func (cn *CNode) SendVersionMessage() error {
 		err := endr.Encode(data)
 		if err != nil {
 			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "error encoding Version Message", err)
+			return err
 		}
 
 		version := NewMessage()
@@ -776,13 +784,14 @@ func (cn *CNode) OnGetDataReqTX(hash string) error {
 	fmt.Printf("Transaction thats being sent %v", txn)
 	if err != nil {
 		cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "error occured trying to get txn from DB", err)
+		return err
 	}
 
 	encoded, err := cn.Utils.Encode(txn)
 
 	if err != nil {
 		cn.server.ErrorChan <- *NewServerError(ErrorInternal, "OnGetDataReqTX error encoding transaction", err)
-
+		return err
 	}
 	if len(encoded) == 0 {
 		fmt.Printf("encoded transaction is empty")
@@ -816,6 +825,7 @@ func (cn *CNode) handler() {
 		if err != nil {
 			message := fmt.Sprintf("error Decoding Message From Peer %v", cn.conn.RemoteAddr())
 			cn.server.ErrorChan <- *NewServerError(ErrorNetwork, message, err)
+			return
 		}
 
 		cn.Addr = cn.conn.RemoteAddr()
@@ -858,6 +868,7 @@ func (cn *CNode) handler() {
 
 			if err != nil {
 				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "error occured Trying to get Blocks from Db for Transaport", err)
+				continue
 			}
 			for _, hash := range blocks {
 				fmt.Println(string(hash))
@@ -866,7 +877,8 @@ func (cn *CNode) handler() {
 
 			errorEncode := gob.NewEncoder(&buff).Encode(blocks)
 			if errorEncode != nil {
-				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Encoding Hashes", err)
+				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Encoding Hashes", errorEncode)
+				continue
 			}
 
 			length := dataByteLen(buff.Bytes())
@@ -884,10 +896,14 @@ func (cn *CNode) handler() {
 
 			if err != nil {
 				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "error occured Trying to get Blocks from Db for Transaport", err)
+				continue
 			}
 			HasAlreadybeenMiner, err := cn.server.DBMan.HasTxnAlreadyBeenMined(string(msg.Data))
-			errMessage := fmt.Sprintf("error checking if the block has already been miner %v", err)
-			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, errMessage, err)
+			if err != nil {
+				errMessage := fmt.Sprintf("error checking if the block has already been miner %v", err)
+				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, errMessage, err)
+				continue
+			}
 			if !exists && !HasAlreadybeenMiner {
 				cn.RequestTxn(msg.Data)
 			}
@@ -899,6 +915,7 @@ func (cn *CNode) handler() {
 			decodedTxn, err := cn.Utils.Decode(msg.Data, &txn)
 			if err != nil {
 				cn.server.ErrorChan <- *NewServerError(ErrorProtocol, "error decoding message from peer", err)
+				continue
 			}
 			e, _ := cn.server.StoreInMempoolAndRelay(cn.server.Ctx, decodedTxn)
 			if e != nil {
@@ -948,7 +965,8 @@ func (cn *CNode) handler() {
 			buff.Write(msg.Data)
 			decoder := gob.NewDecoder(&buff)
 			if err := decoder.Decode(&hashes); err != nil {
-				fmt.Printf("failed to decode hashes: %v", err)
+				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "failed to decode hashes", err)
+				continue
 			}
 			//! Debug loggs
 			for _, hash := range hashes {
@@ -958,6 +976,7 @@ func (cn *CNode) handler() {
 			blocks, err := cn.server.DBMan.GetBlocksForGivenHashes(hashes)
 			if err != nil {
 				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "failed to get blocks: %v", err)
+				continue
 			}
 
 			errorBlocks := cn.PrepareAndSendBlocks(blocks)
@@ -977,10 +996,12 @@ func (cn *CNode) handler() {
 			err := gob.NewDecoder(&buff).Decode(&blocks)
 			if err != nil {
 				cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Decoding Recived Blocks", err)
+				continue
 			}
 			err = cn.ValidateAndStoreNewRecivedBlocks(blocks)
 			if err != nil {
 				cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error Validating Blocks", err)
+				continue
 			}
 
 		} else if msg.Cammand == byte(PING) {
@@ -995,16 +1016,14 @@ func (cn *CNode) handler() {
 
 func (cn *CNode) ValidateAndStoreNewRecivedBlocks(blocks []DBMan.Block) error {
 	for _, block := range blocks {
-		valid := cn.server.IsBlockValid(&block.Header)
-		if !valid {
+		if !cn.server.IsBlockValid(&block.Header) {
 			errorMessage := fmt.Sprintf("recived Block with %s is Invalid rejecting", block.Hash)
 			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, errorMessage, nil)
+			continue
 		}
-	}
-	for _, block := range blocks {
-		err := cn.server.DBMan.StoreBlock(block)
-		if err != nil {
+		if err := cn.server.DBMan.StoreBlock(block); err != nil {
 			cn.server.ErrorChan <- *NewServerError(ErrorDatabase, "Error Storing Recived Blocks", err)
+			continue
 		}
 		cn.RecievedBytes += uint64(block.BytesLen())
 	}
@@ -1029,7 +1048,9 @@ func (cn *CNode) SendPing() {
 }
 func (cn *CNode) PrepareAndSendBlocks(blocks []DBMan.Block) error {
 	if blocks == nil {
-		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("cannot send nil blocks"))
+		err := fmt.Errorf("cannot send nil blocks")
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", err)
+		return err
 	}
 
 	var buff bytes.Buffer
@@ -1039,7 +1060,9 @@ func (cn *CNode) PrepareAndSendBlocks(blocks []DBMan.Block) error {
 
 	encodedData := buff.Bytes()
 	if len(encodedData) == 0 {
-		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "encoded blocks resulted in empty data", nil)
+		err := fmt.Errorf("encoded blocks resulted in empty data")
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, err.Error(), err)
+		return err
 	}
 
 	blocksResponseMessage := NewMessage()
@@ -1050,14 +1073,20 @@ func (cn *CNode) PrepareAndSendBlocks(blocks []DBMan.Block) error {
 
 	encodedMessage := encodeMessage(blocksResponseMessage)
 	if encodedMessage == nil {
-		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("failed to encode message"))
+		err := fmt.Errorf("failed to encode message")
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", err)
+		return err
 	}
 
 	if cn.VSend == nil {
-		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "send channel is nil", nil)
+		err := fmt.Errorf("send channel is nil")
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, err.Error(), err)
+		return err
 	}
 	if !cn.Enqueue(encodedMessage) {
-		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", fmt.Errorf("peer closed, dropped block message"))
+		err := fmt.Errorf("peer closed, dropped block message")
+		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "", err)
+		return err
 	}
 	return nil
 
@@ -1071,6 +1100,7 @@ func (cn *CNode) RequestBlocksForGivenHases(hashes []string) {
 
 	if err != nil {
 		cn.server.ErrorChan <- *NewServerError(ErrorNetwork, "Error Encoding Hashes", err)
+		return
 	}
 	// Create the message
 	newBlockRequestMessage := NewMessage()
@@ -1167,6 +1197,7 @@ func (s *Server) BroadCasteBlock(block *DBMan.Block) error {
 	err := gob.NewEncoder(&buff).Encode(block)
 	if err != nil {
 		s.ErrorChan <- *(NewServerError(ErrorNetwork, "Error Encoding Block", err))
+		return err
 	}
 
 	length := dataByteLen(buff.Bytes())
@@ -1238,11 +1269,20 @@ func (s *Server) StoreInMempoolAndRelay(ctx context.Context, transaction DBMan.T
 	return nil, added
 }
 func (cn *CNode) PingHandler(duration uint8) {
+	if duration == 0 {
+		return
+	}
 	ticker := time.NewTicker(time.Duration(duration) * time.Minute)
-	for t := range ticker.C {
-		cn.Timer.start = time.Now()
-		cn.SendPing()
-		fmt.Println("Sending Ping  at:", t)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-cn.done:
+			return
+		case t := <-ticker.C:
+			cn.Timer.start = time.Now()
+			cn.SendPing()
+			fmt.Println("Sending Ping  at:", t)
+		}
 	}
 }
 
